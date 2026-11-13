@@ -13,7 +13,7 @@ from transformers import Wav2Vec2Processor
 
 from ..core.device.npu_compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
-from ..core import ModelConfig, gradient_checkpoint_forward
+from ..core import ModelConfig, gradient_checkpoint_forward, load_state_dict
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
 from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
@@ -28,6 +28,9 @@ from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 from ..models.wan_animate_2_dit import WanAnimate2Transformer
+from ..models.wan_video_ucpe import (
+    UCPECameraEncoder, build_ucpe_ray_features, validate_ucpe_lora_checkpoint,
+)
 
 
 class WanVideoPipeline(BasePipeline):
@@ -62,6 +65,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_ImageEmbedderVAE(),
             WanVideoUnit_ImageEmbedderCLIP(),
             WanVideoUnit_ImageEmbedderFused(),
+            WanVideoUnit_UCPECamera(),
             WanVideoUnit_FunControl(),
             WanVideoUnit_FunReference(),
             WanVideoUnit_FunCameraControl(),
@@ -91,6 +95,52 @@ class WanVideoPipeline(BasePipeline):
         self.model_fn = model_fn_wan_video
         self.compilable_models = ["dit", "dit2"]
 
+    def enable_ucpe_camera(
+        self,
+        condition="relray_absmap",
+        hidden_dim=256,
+        dropout=0.0,
+        normalize_to_first=True,
+        translation_scale=1.0,
+    ):
+        """Enable low-overhead UCPE ray conditioning for Wan2.2 TI2V-5B."""
+        if self.dit is None or self.dit2 is not None:
+            raise ValueError("UCPE ray conditioning currently supports the single-DiT Wan2.2 TI2V-5B model only.")
+        if self.vae is None or self.vae.z_dim != 48 or self.vae.upsampling_factor != 16:
+            raise ValueError("UCPE ray conditioning requires the Wan2.2 48-channel VAE with 16x spatial compression.")
+        if not self.dit.fuse_vae_embedding_in_latents or self.dit.patch_size != (1, 2, 2):
+            raise ValueError("UCPE ray conditioning requires Wan2.2 TI2V-5B fused I2V conditioning and (1,2,2) patches.")
+        if condition not in ("relray", "relray_absmap"):
+            raise ValueError("condition must be 'relray' or 'relray_absmap'.")
+        if not 0 <= dropout < 1:
+            raise ValueError("UCPE camera dropout must be in [0,1).")
+        if translation_scale <= 0:
+            raise ValueError("UCPE camera translation_scale must be positive.")
+        in_dim = 16 if condition == "relray" else 19
+        encoder = UCPECameraEncoder(in_dim, self.dit.dim, hidden_dim)
+        self.dit.ucpe_camera_encoder = encoder.to(device=self.device, dtype=self.torch_dtype)
+        self.dit.ucpe_camera_condition = condition
+        self.dit.ucpe_camera_dropout = dropout
+        self.dit.ucpe_camera_normalize_to_first = normalize_to_first
+        self.dit.ucpe_camera_translation_scale = translation_scale
+        return self.dit.ucpe_camera_encoder
+
+    def load_ucpe_camera_checkpoint(self, path):
+        if getattr(self.dit, "ucpe_camera_encoder", None) is None:
+            raise ValueError("Call enable_ucpe_camera() before loading a UCPE camera checkpoint.")
+        state_dict = path if isinstance(path, dict) else load_state_dict(path)
+        prefixes = ("ucpe_camera_encoder.", "pipe.dit.ucpe_camera_encoder.")
+        camera_state_dict = {}
+        for prefix in prefixes:
+            camera_state_dict.update({name[len(prefix):]: value for name, value in state_dict.items() if name.startswith(prefix)})
+        if len(camera_state_dict) == 0:
+            raise ValueError(f"No 'ucpe_camera_encoder.*' weights found in {path}. The camera encoder is not a DiT LoRA; use a checkpoint trained with UCPE enabled.")
+        lora_prefixes = ("blocks.", "pipe.dit.blocks.")
+        if any(name.startswith(lora_prefixes) for name in state_dict):
+            prefix = "pipe.dit." if any(name.startswith("pipe.dit.blocks.") for name in state_dict) else ""
+            validate_ucpe_lora_checkpoint(state_dict, prefix=prefix)
+        self.dit.ucpe_camera_encoder.load_state_dict(camera_state_dict, strict=True)
+        print(f"Loaded {len(camera_state_dict)} UCPE camera tensors from checkpoint.")
 
     def enable_usp(self):
         from ..utils.xfuser import get_sequence_parallel_world_size, usp_attn_forward, usp_dit_forward, usp_vace_forward
@@ -221,6 +271,7 @@ class WanVideoPipeline(BasePipeline):
         camera_control_direction: Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"] = None,
         camera_control_speed: float = 1/54,
         camera_control_origin: tuple = (0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0),
+        camera_trajectory=None,
         # VACE
         vace_video: list[Image.Image] = None,
         vace_video_mask: Image.Image = None,
@@ -304,6 +355,7 @@ class WanVideoPipeline(BasePipeline):
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
             "camera_control_direction": camera_control_direction, "camera_control_speed": camera_control_speed, "camera_control_origin": camera_control_origin,
+            "camera_trajectory": camera_trajectory,
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
             "height": height, "width": width, "num_frames": num_frames,
@@ -554,6 +606,49 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
         latents[:, :, 0: 1] = z
         return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frame_latents": z}
 
+
+
+class WanVideoUnit_UCPECamera(PipelineUnit):
+    """Compute UCPE embeddings once per video, not once per denoising step."""
+
+    def __init__(self):
+        super().__init__(
+            input_params=("camera_trajectory", "height", "width", "num_frames", "latents"),
+            output_params=("ucpe_camera_embedding",),
+            onload_model_names=("dit",),
+        )
+
+    def process(self, pipe: WanVideoPipeline, camera_trajectory, height, width, num_frames, latents):
+        if camera_trajectory is None:
+            return {}
+        encoder = getattr(pipe.dit, "ucpe_camera_encoder", None)
+        if encoder is None:
+            raise ValueError("A camera trajectory was provided, but UCPE is not enabled. Call pipe.enable_ucpe_camera() and load the camera checkpoint first.")
+        drop_camera = (
+            pipe.scheduler.training
+            and torch.is_grad_enabled()
+            and torch.rand(()) < pipe.dit.ucpe_camera_dropout
+        )
+        pipe.load_models_to_device(self.onload_model_names)
+        features = build_ucpe_ray_features(
+            trajectory=camera_trajectory,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            latent_frames=latents.shape[2],
+            vae_stride=(4, pipe.vae.upsampling_factor, pipe.vae.upsampling_factor),
+            patch_size=pipe.dit.patch_size,
+            condition=pipe.dit.ucpe_camera_condition,
+            normalize_to_first=pipe.dit.ucpe_camera_normalize_to_first,
+            translation_scale=pipe.dit.ucpe_camera_translation_scale,
+            device=pipe.device,
+        )
+        embedding = encoder(features.to(dtype=pipe.torch_dtype))
+        # Multiply by zero instead of skipping the module so DDP still sees a
+        # camera autograd path when camera dropout is enabled.
+        if drop_camera:
+            embedding = embedding * 0.0
+        return {"ucpe_camera_embedding": embedding}
 
 
 class WanVideoUnit_FunControl(PipelineUnit):
@@ -1486,6 +1581,7 @@ def model_fn_wan_video(
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
+    ucpe_camera_embedding = None,
     fuse_vae_embedding_in_latents: bool = False,
     wantodance_refimage_feature = None,
     wantodance_fps: float = 30.0,
@@ -1493,6 +1589,8 @@ def model_fn_wan_video(
     skip_9th_layer: bool = False,
     **kwargs,
 ):
+    if ucpe_camera_embedding is not None and sliding_window_size is not None:
+        raise NotImplementedError("UCPE ray conditioning does not currently support sliding-window denoising. Disable sliding_window_size/sliding_window_stride.")
     if sliding_window_size is not None and sliding_window_stride is not None:
         model_kwargs = dict(
             dit=dit,
@@ -1601,7 +1699,15 @@ def model_fn_wan_video(
         x = dit.patchify(x, control_camera_latents_input, enable_wantodance_global=True)
     else:
         x = dit.patchify(x, control_camera_latents_input)
-    
+    # UCPE: add to existing patches; token count and attention shapes are unchanged.
+    if ucpe_camera_embedding is not None:
+        expected_shape = (x.shape[0], x.shape[2], x.shape[3], x.shape[4], x.shape[1])
+        if ucpe_camera_embedding.shape == (1, *expected_shape[1:]) and x.shape[0] != 1:
+            ucpe_camera_embedding = ucpe_camera_embedding.expand(x.shape[0], -1, -1, -1, -1)
+        if tuple(ucpe_camera_embedding.shape) != expected_shape:
+            raise ValueError(f"UCPE camera shape {tuple(ucpe_camera_embedding.shape)} does not match DiT patches {expected_shape}.")
+        x = x + ucpe_camera_embedding.permute(0, 4, 1, 2, 3).to(device=x.device, dtype=x.dtype)
+
     # Animate
     if pose_latents is not None and face_pixel_values is not None:
         x, motion_vec = animate_adapter.after_patch_embedding(x, pose_latents, face_pixel_values)

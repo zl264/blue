@@ -466,7 +466,7 @@ class DiffusionTrainingModule(torch.nn.Module):
     def resume_from_checkpoint(self, path, remove_prefix_in_ckpt):
         if path is None:
             return
-        state_dict = load_state_dict(path)
+        state_dict = path if isinstance(path, dict) else load_state_dict(path)
         if remove_prefix_in_ckpt is not None:
             state_dict = {remove_prefix_in_ckpt + i: state_dict[i] for i in state_dict}
         missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)

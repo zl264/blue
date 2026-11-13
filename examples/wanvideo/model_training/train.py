@@ -1,6 +1,7 @@
 import torch, os, argparse, accelerate, warnings
-from diffsynth.core import UnifiedDataset
+from diffsynth.core import UnifiedDataset, load_state_dict
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
+from diffsynth.models.wan_video_ucpe import LoadUCPECameraTrajectory, validate_ucpe_lora_coverage
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -25,6 +26,12 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        ucpe_camera_condition=None,
+        ucpe_camera_hidden_dim=256,
+        ucpe_camera_dropout=0.0,
+        ucpe_camera_normalize_to_first=True,
+        ucpe_camera_translation_scale=1.0,
+        ucpe_camera_checkpoint=None,
     ):
         super().__init__()
         # Warning
@@ -38,7 +45,20 @@ class WanTrainingModule(DiffusionTrainingModule):
         audio_processor_config = self.parse_path_or_model_id(audio_processor_path)
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
-        self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
+        if ucpe_camera_condition is not None:
+            self.pipe.enable_ucpe_camera(
+                condition=ucpe_camera_condition,
+                hidden_dim=ucpe_camera_hidden_dim,
+                dropout=ucpe_camera_dropout,
+                normalize_to_first=ucpe_camera_normalize_to_first,
+                translation_scale=ucpe_camera_translation_scale,
+            )
+            if ucpe_camera_checkpoint is not None:
+                self.pipe.load_ucpe_camera_checkpoint(ucpe_camera_checkpoint)
+        elif ucpe_camera_checkpoint is not None:
+            raise ValueError("--ucpe_camera_checkpoint requires --ucpe_camera_condition.")
+        if ucpe_camera_condition is None:
+            self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
         
         # Training mode
         self.switch_pipe_to_training_mode(
@@ -47,6 +67,28 @@ class WanTrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+        if ucpe_camera_condition is not None:
+            if lora_base_model != "dit":
+                raise ValueError("UCPE camera training requires --lora_base_model dit.")
+            validate_ucpe_lora_coverage(self.pipe.dit)
+            # freeze_except() runs before LoRA injection, so explicitly unfreeze
+            # the newly attached non-LoRA camera encoder afterwards.
+            self.pipe.dit.ucpe_camera_encoder.requires_grad_(True)
+            self.pipe.dit.ucpe_camera_encoder.train()
+            if resume_from_checkpoint is not None:
+                state_dict = load_state_dict(resume_from_checkpoint)
+                self.pipe.load_ucpe_camera_checkpoint(state_dict)
+                lora_state_dict = {
+                    ("pipe.dit." + name if remove_prefix_in_ckpt else name): value
+                    for name, value in state_dict.items()
+                    if ".lora_A." in name or ".lora_B." in name
+                }
+                if len(lora_state_dict) == 0:
+                    raise ValueError(f"No LoRA weights found in resume checkpoint: {resume_from_checkpoint}")
+                # Keys exported without pipe.dit. are restored before adding the
+                # prefix; lora_state_dict already contains the prefixed keys.
+                self.resume_from_checkpoint(lora_state_dict, None)
+
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -124,6 +166,12 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
+    parser.add_argument("--ucpe_camera_condition", choices=["relray", "relray_absmap", "none"], default="none", help="Enable UCPE relative-ray conditioning. Use with --data_file_keys video,camera_trajectory and --extra_inputs input_image,camera_trajectory.")
+    parser.add_argument("--ucpe_camera_hidden_dim", type=int, default=256, help="Hidden dimension of the one-time UCPE ray projection.")
+    parser.add_argument("--ucpe_camera_dropout", type=float, default=0.0, help="Probability of dropping camera conditioning per training sample.")
+    parser.add_argument("--ucpe_camera_world_coordinates", default=False, action="store_true", help="Keep dataset world coordinates instead of expressing all poses relative to the first camera (the default).")
+    parser.add_argument("--ucpe_camera_translation_scale", type=float, default=1.0, help="Global multiplier for camera translations, applied after optional per-file translation_scale.")
+    parser.add_argument("--ucpe_camera_checkpoint", type=str, default=None, help="UCPE checkpoint containing ucpe_camera_encoder.* weights for warm-start or inference. Use --resume_from_checkpoint to resume both LoRA and camera weights.")
     return parser
 
 
@@ -154,6 +202,7 @@ if __name__ == "__main__":
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
             "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
             "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
+            "camera_trajectory": ToAbsolutePath(args.dataset_base_path) >> LoadUCPECameraTrajectory(),
         }
     )
     model = WanTrainingModule(
@@ -180,6 +229,12 @@ if __name__ == "__main__":
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        ucpe_camera_condition=None if args.ucpe_camera_condition == "none" else args.ucpe_camera_condition,
+        ucpe_camera_hidden_dim=args.ucpe_camera_hidden_dim,
+        ucpe_camera_dropout=args.ucpe_camera_dropout,
+        ucpe_camera_normalize_to_first=not args.ucpe_camera_world_coordinates,
+        ucpe_camera_translation_scale=args.ucpe_camera_translation_scale,
+        ucpe_camera_checkpoint=args.ucpe_camera_checkpoint,
     )
     model_logger = ModelLogger(
         args.output_path,
