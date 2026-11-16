@@ -76,7 +76,7 @@ P_camera = Z_subject * K^-1 * [u_render+0.5, v_render+0.5, 1]
 P_subject = R_initial * P_camera + t_initial
 ```
 
-`Z_subject` 默认来自与 RGB 对齐的 Depth-Pro 深度图。为与实际点云渲染一致，对超过渲染阈值的远深度，先应用与 `point_rendering` 相同的 depth contraction，再计算主体世界坐标。
+`Z_subject` 默认来自 `--depth_model` 所选后端（默认 MoGe-3 ViT-L，可回退 Depth-Pro）的、与 RGB 对齐的相机 z 深度图。为与实际点云渲染一致，对超过渲染阈值的远深度，先应用与 `point_rendering` 相同的 depth contraction，再计算主体世界坐标。
 
 如果指定 `--subject_depth Z`，`Z` 必须是应用该渲染变换后的深度单位；图像缩放不会再次缩放它。`subject_info.json` 同时记录源深度和渲染深度，便于核对。
 
@@ -125,7 +125,7 @@ v_initial = C_initial - P_subject
 ## 6. 常见问题与限制
 
 - **主体偏向背景或深度跳变**：检查 `subject_info.json` 的源深度，减小 `--subject_depth_radius`，或点击主体内部。
-- **运动尺度异常**：Depth-Pro 深度、三维中心和相机平移共享渲染深度尺度；不要把像素缩放系数乘到深度上。
+- **运动尺度异常**：所选后端深度、三维中心和相机平移共享渲染深度尺度；不要把像素缩放系数乘到深度上。
 - **运镜后主体暂时不在中央**：这是默认前 10% 帧平滑转向的结果；可减小 `--subject_look_at_start`，但不建议对偏心主体设为零。
 - **大角度出现空洞或背面伪影**：单目首帧点云没有真实背面，仍依赖生成模型补全；本扩展不保证 360° 的真实三维一致性。
 - **首帧与原图不一致**：渲染器仍沿用官方首帧替换策略；额外检查深度、分割和参考图预处理是否成功。

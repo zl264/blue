@@ -27,7 +27,7 @@ from pytorch3d.structures import Pointclouds, Meshes
 from torchvision.transforms import ToTensor
 from ultralytics import YOLO
 
-import third_party.depth_pro.depth_pro as depth_pro
+from src.depth_estimation import create_depth_estimator
 from src.pointcloud import PointsZbufRenderer, get_boundaries_mask, suppress_stdout_stderr
 from src.render import MeshRendererWrap, create_lights
 from src.utils import points_padding, np_points_padding, rotation_matrix_from_vectors, traj_map, set_initial_camera
@@ -106,9 +106,17 @@ if __name__ == '__main__':
                         help="Initial angle, no exceptions to change")
     parser.add_argument("--input_fps", default=None, type=int,
                         help="the fps of the original video, keep it None if we have cs_map.mp4")
+    parser.add_argument("--depth_model", default="moge3-vitl",
+                        choices=["moge3-vitl", "moge3-vitg", "moge2-vitl", "depth-pro"],
+                        help="Metric depth backend; use depth-pro for original alignment behavior")
+    parser.add_argument("--depth_checkpoint", default=None, type=str)
+    parser.add_argument("--depth_refine_steps", default=3, type=int)
+    parser.add_argument("--depth_fp16", action="store_true")
     parser.add_argument("--smpl_follow", action="store_true", help="whether the camera will move along the human body")
 
     args = parser.parse_args()
+    if args.depth_refine_steps < 0:
+        raise ValueError("depth_refine_steps must be nonnegative.")
 
     # 固定路径和setting
     smplx_sc_color_path = "./third_party/GVHMR_realisdance/hmr4d/utils/body_model/smplx_color.pt"
@@ -117,12 +125,13 @@ if __name__ == '__main__':
     blend_params = BlendParams(sigma=1e-4, gamma=1e-4, background_color=(0, 0, 0))
 
     device = "cuda"
-    print("Init depth model")
-    depth_model, depth_transform = depth_pro.create_model_and_transforms(device=device)
-    depth_model = depth_model.eval()
+    print(f"Init depth model: {args.depth_model}")
+    depth_estimator = create_depth_estimator(
+        args.depth_model, device=device, checkpoint=args.depth_checkpoint,
+        refine_steps=args.depth_refine_steps, use_fp16=args.depth_fp16,
+    )
 
     print("Init GeoCalib")
-    geo_model = GeoCalib().to(device)
 
     print("Init Yolo")
     yolo_model = YOLO("yolo11n-pose.pt")
@@ -165,25 +174,25 @@ if __name__ == '__main__':
         bin_size=0
     )
 
-    # inference depth
-    depth_image = np.array(image)
-    depth_image = depth_transform(depth_image)
-    prediction = depth_model.infer(depth_image, f_px=None)
-    depth = prediction["depth"]  # Depth in [m].
-    focallength_px = prediction["focallength_px"].item()  # Focal length in pixels.
+    # inference RGB-aligned metric camera-z and pixel intrinsics
+    depth_prediction = depth_estimator.predict(validation_image[0])
+    depth = depth_prediction.depth
+    K = depth_prediction.intrinsic.float()
+    K_inv = K.inverse()
+    depth = torch.clip(depth, 1e-4, 100)  # Preserve original alignment far clip.
+    del depth_estimator
+    torch.cuda.empty_cache()
 
-    # gravity calibration
+    # gravity calibration; GeoCalib currently accepts a scalar focal prior, so
+    # retain that original approximation while rendering uses full fx/fy K.
+    focal_length_tensor = torch.tensor([
+        K[0, 0] / width * w_origin, K[1, 1] / height * h_origin
+    ], dtype=torch.float32).mean().to(device)
+    print("Init GeoCalib")
+    geo_model = GeoCalib().to(device)
     geo_inputs = geo_model.load_image(args.input_image).to(device)
-    focal_length_tensor = torch.tensor([focallength_px / width * w_origin, focallength_px / height * h_origin],
-                                       dtype=torch.float32).mean().to(device)
     result = geo_model.calibrate(geo_inputs, priors={"focal": focal_length_tensor})
     c_gravity = result["gravity"]._data.cpu().T  # [1,3]->[3,1]
-
-    K = torch.tensor([[focallength_px, 0, width / 2],
-                      [0, focallength_px, height / 2],
-                      [0, 0, 1]], dtype=torch.float32)
-    K_inv = K.inverse()
-    depth = torch.clip(depth, 1e-4, 100)  # clip for inf depth
 
     # unproject into 3D points
     points2d = torch.stack(torch.meshgrid(torch.arange(width, dtype=torch.float32),
@@ -316,7 +325,19 @@ if __name__ == '__main__':
         "smpl_follow": args.smpl_follow,
         "use_geocalib": True
     }
-    cam_info = {"intrinsic": K.numpy().tolist(), "extrinsic": w2cs.numpy().tolist(), "height": height, "width": width, "meta_info": meta_info}
+    cam_info = {
+        "intrinsic": K.numpy().tolist(), "extrinsic": w2cs.numpy().tolist(),
+        "height": height, "width": width, "meta_info": meta_info,
+        "depth_model": {
+            "name": args.depth_model,
+            "checkpoint": args.depth_checkpoint,
+            "predicted_name": depth_prediction.model_name,
+            "refine_steps": args.depth_refine_steps if args.depth_model.startswith("moge3") else None,
+            "fp16": args.depth_fp16,
+            "filled_pixels": depth_prediction.filled_pixels,
+            "filled_pixel_fraction": depth_prediction.filled_pixels / (height * width),
+        },
+    }
     with open(f"{args.output_path}/cam_info.json", "w") as writer:
         json.dump(cam_info, writer)
 

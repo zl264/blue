@@ -51,6 +51,21 @@ cd ../..
 
 ## Camera control inference
 
+### Commercial depth backends (added extension)
+
+`cam_render.py` and the human-alignment entry point `alignment.py` now default to
+**MoGe-3 ViT-L** for metric depth and intrinsics. Use `--depth_model moge3-vitg`
+for the larger quality-oriented checkpoint, or `--depth_model depth-pro` to
+reproduce the original backend. MoGe-3 weights are marked MIT; DA3
+Giant/Large/Nested and UniDepthV2 are non-commercial and are not used here.
+MoGe-3 has additional FlexGEMM/Triton and NumPy 2 requirements that must be
+validated against the Uni3C environment before installation.
+
+See [docs/depth_estimation.md](docs/depth_estimation.md) for the license/model
+comparison, official benchmarks, installation caveats and GPU A/B protocol. The
+backend integration is statically checked only until real MoGe inference and
+Uni3C GPU rendering are run.
+
 ### Stage 1. Rendering pointclouds and video
 
 There are 7 parameters to control the camera freely.
@@ -82,8 +97,8 @@ verification status.
 
 Pass `--subject_pixel U V` to make any existing trajectory orbit around a clicked
 subject instead of the default foreground center. The coordinate is in the
-**EXIF-corrected original input image**, not the resized render. Depth-Pro's
-aligned camera-z depth and the estimated intrinsics lift that pixel to a 3D point.
+**EXIF-corrected original input image**, not the resized render. The selected
+backend's camera-z depth and estimated intrinsics lift that pixel to a 3D point.
 The original seven parameters and all `traj_type` presets still work. After frame
 0, the camera smoothly turns to look at the subject; frame 0 keeps the original
 pose rather than abruptly rotating an off-center subject.
@@ -110,8 +125,8 @@ python cam_render.py --reference_image "data/demo/flux-0.png" \
 
 Depth is sampled from a small neighborhood by default. Use
 `--subject_depth_radius 0` for nearest-pixel sampling, or `--subject_depth Z` to
-override it with a positive camera-z value in rendered depth units (meters for
-Depth-Pro). Do not multiply this override by the image-resize factor. Clicking a
+override it with a positive camera-z value in the selected backend's rendered
+metric depth units. Do not multiply this override by the image-resize factor. Clicking a
 depth discontinuity may select the background; inspect `subject_info.json` and
 the rendered video. `--subject_keep_upright` uses world `-y` as the up reference;
 by default the source camera's up direction is retained. Increase

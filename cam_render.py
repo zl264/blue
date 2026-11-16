@@ -13,7 +13,7 @@ from diffusers.utils import export_to_video
 from pytorch3d.renderer import PointsRasterizationSettings
 from torchvision.transforms import ToTensor, ToPILImage
 
-import third_party.depth_pro.depth_pro as depth_pro
+from src.depth_estimation import create_depth_estimator
 from src.pointcloud import point_rendering, contract_depth
 from src.utils import traj_map, points_padding, np_points_padding, set_initial_camera, build_cameras
 from src.subject_camera import aim_cameras_at_subject, lift_subject_to_world
@@ -50,10 +50,19 @@ def main():
                         help="Focal length, range 0.25 to 2.5; changing focal length zooms in and out")
     parser.add_argument("--start_elevation", default=5.0, type=float,
                         help="Initial angle, no exceptions to change")
+    parser.add_argument("--depth_model", default="moge3-vitl",
+                        choices=["moge3-vitl", "moge3-vitg", "moge2-vitl", "depth-pro"],
+                        help="Metric depth backend; MoGe-3 weights are MIT, use depth-pro to reproduce the original pipeline")
+    parser.add_argument("--depth_checkpoint", default=None, type=str,
+                        help="Optional local/Hugging Face MoGe checkpoint; defaults to the official selected variant")
+    parser.add_argument("--depth_refine_steps", default=3, type=int,
+                        help="MoGe-3 sparse volumetric refinement steps; 3 follows the official default")
+    parser.add_argument("--depth_fp16", action="store_true",
+                        help="Use MoGe mixed precision; validate geometry before production use")
     parser.add_argument("--subject_pixel", default=None, type=float, nargs=2, metavar=("U", "V"),
                         help="Subject pixel [u,v] in the EXIF-corrected original reference image; enables subject-centered camera motion")
     parser.add_argument("--subject_depth", default=None, type=float,
-                        help="Optional positive camera-z override at subject_pixel, in rendered depth units (Depth-Pro: meters); otherwise sample the aligned depth map")
+                        help="Optional positive camera-z override at subject_pixel, in the selected backend's rendered metric depth units; otherwise sample the aligned depth map")
     parser.add_argument("--subject_depth_radius", default=2, type=int,
                         help="Median depth patch radius in resized pixels; 0 samples only the nearest pixel")
     parser.add_argument("--subject_world_up", default=[0.0, -1.0, 0.0], type=float, nargs=3,
@@ -64,14 +73,16 @@ def main():
                         help="Use subject_world_up (default world -y) instead of retaining the source camera's up direction")
 
     args = parser.parse_args()
+    if args.depth_refine_steps < 0:
+        raise ValueError("depth_refine_steps must be nonnegative.")
     device = "cuda"
-    print("Init depth model")
-    depth_model, depth_transform = depth_pro.create_model_and_transforms(device=device)
-    depth_model = depth_model.eval()
+    print(f"Init depth model: {args.depth_model}")
+    depth_estimator = create_depth_estimator(
+        args.depth_model, device=device, checkpoint=args.depth_checkpoint,
+        refine_steps=args.depth_refine_steps, use_fp16=args.depth_fp16,
+    )
 
     print("Init mask model")
-    seg_net = TracerUniversalB7(device=device, batch_size=1,
-                                model_path=hf_hub_download(repo_id="Carve/tracer_b7", filename="tracer_b7.pth")).eval()
 
     # == motion definition ==
     if args.traj_type == "custom":
@@ -94,21 +105,26 @@ def main():
     image = image.resize((width, height), Image.Resampling.BICUBIC)
     validation_image = ToTensor()(image)[None]  # [1,c,h,w], 0~1
 
+    # All depth backends see the same resized RGB pixel grid. MoGe consumes
+    # [0,1] RGB directly; Depth-Pro owns its own normalization in its adapter.
+    depth_prediction = depth_estimator.predict(validation_image[0])
+    depth = depth_prediction.depth[None, None]
+    K = depth_prediction.intrinsic.float()
+    K_inv = K.inverse()
+    intrinsic = K[None].repeat(args.nframe, 1, 1)
+    depth_image = validation_image[0] * 2 - 1  # Colors for exported point cloud.
+    print(f"Depth backend: {depth_prediction.model_name}; "
+          f"invalid pixels conservatively filled: {depth_prediction.filled_pixels}; "
+          f"fx/fy: {K[0,0].item():.3f}/{K[1,1].item():.3f}")
+    del depth_estimator
+    torch.cuda.empty_cache()
+
     os.makedirs(args.output_path, exist_ok=True)
 
-    # inference depth
-    with torch.no_grad():
-        depth_image = np.array(image)
-        depth_image = depth_transform(depth_image)
-        prediction = depth_model.infer(depth_image, f_px=None)
-        depth = prediction["depth"]  # Depth in [m].
-        depth = depth[None, None]
-        focallength_px = prediction["focallength_px"].item()  # Focal length in pixels.
-        K = torch.tensor([[focallength_px, 0, width / 2],
-                          [0, focallength_px, height / 2],
-                          [0, 0, 1]], dtype=torch.float32)
-        K_inv = K.inverse()
-        intrinsic = K[None].repeat(args.nframe, 1, 1)
+    # Load the segmentation network only after releasing the depth backend.
+    print("Init mask model")
+    seg_net = TracerUniversalB7(device=device, batch_size=1,
+                                model_path=hf_hub_download(repo_id="Carve/tracer_b7", filename="tracer_b7.pth")).eval()
 
     # get pointcloud
     points2d = torch.stack(torch.meshgrid(torch.arange(width, dtype=torch.float32),
@@ -199,6 +215,15 @@ def main():
         # including the existing focal_length ramp.
         "per_frame_intrinsic": intrinsic.cpu().numpy().tolist(),
         "extrinsic": w2cs_list, "height": height, "width": width,
+        "depth_model": {
+            "name": args.depth_model,
+            "checkpoint": args.depth_checkpoint,
+            "predicted_name": depth_prediction.model_name,
+            "refine_steps": args.depth_refine_steps if args.depth_model.startswith("moge3") else None,
+            "fp16": args.depth_fp16,
+            "filled_pixels": depth_prediction.filled_pixels,
+            "filled_pixel_fraction": depth_prediction.filled_pixels / (height * width),
+        },
     }
     if subject_info is not None:
         camera_infos["subject"] = {
