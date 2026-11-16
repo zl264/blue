@@ -72,6 +72,20 @@ def suppress_stdout_stderr():
             os.close(old_stderr_fd)
 
 
+def contract_depth(depth, contract=8.0):
+    """Return the finite far-depth transform used by the point renderer.
+
+    This is shared with subject lifting so orbit radii and actual rendered
+    geometry use exactly the same depth scale. Source camera-z remains the input.
+    """
+    mid_depth = torch.median(depth.reshape(-1), dim=0)[0] * contract
+    return torch.where(
+        depth > mid_depth,
+        2 * mid_depth - mid_depth ** 2 / (depth + 1e-6),
+        depth,
+    )
+
+
 def point_rendering(K, w2cs, depth, image, raster_settings, device,
                     background_color=[0, 0, 0], sobel_threshold=0.35, contract=8.0,
                     sam_mask=None):
@@ -90,7 +104,7 @@ def point_rendering(K, w2cs, depth, image, raster_settings, device,
     _, _, h, w = image.shape
 
     # depth contract
-    depth = depth.to(device)
+    depth = depth.to(device).clone()
     K = K.to(device)
     w2cs = w2cs.to(device)
     image = image.to(device)
@@ -101,7 +115,7 @@ def point_rendering(K, w2cs, depth, image, raster_settings, device,
         render_masks = torch.ones((nframe, 1, h, w), device=device, dtype=torch.float32)
     else:
         mid_depth = torch.median(depth.reshape(-1), dim=0)[0] * contract
-        depth[depth > mid_depth] = ((2 * mid_depth) - (mid_depth ** 2 / (depth[depth > mid_depth] + 1e-6)))
+        depth = contract_depth(depth, contract=contract)
 
         point_depth = einops.rearrange(depth[0], "c h w -> (h w) c")
         disp = 1 / (depth + 1e-7)

@@ -44,7 +44,16 @@ def load_dataset(reference_image, render_path, nframe, max_area, pipe, use_camer
     intrinsic = torch.tensor(np.array(cam_info["intrinsic"]), dtype=torch.float32, device=device)
     intrinsic[0, :] = intrinsic[0, :] / cam_info["width"] * width
     intrinsic[1, :] = intrinsic[1, :] / cam_info["height"] * height
-    intrinsic = intrinsic[None].repeat(nframe, 1, 1)
+    if "per_frame_intrinsic" in cam_info:
+        # New render outputs may carry a focal-length trajectory. Preserve the
+        # original single-K behavior for older outputs.
+        intrinsic = torch.tensor(np.array(cam_info["per_frame_intrinsic"]), dtype=torch.float32, device=device)
+        intrinsic[:, 0, :] = intrinsic[:, 0, :] / cam_info["width"] * width
+        intrinsic[:, 1, :] = intrinsic[:, 1, :] / cam_info["height"] * height
+        if intrinsic.shape[0] != nframe:
+            raise ValueError("per_frame_intrinsic must contain one K per rendered frame.")
+    else:
+        intrinsic = intrinsic[None].repeat(nframe, 1, 1)
     if use_camera_embedding:
         camera_embedding = get_camera_embedding(intrinsic, w2cs, nframe, height, width, normalize=True)
     else:

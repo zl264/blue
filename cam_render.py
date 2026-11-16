@@ -14,8 +14,9 @@ from pytorch3d.renderer import PointsRasterizationSettings
 from torchvision.transforms import ToTensor, ToPILImage
 
 import third_party.depth_pro.depth_pro as depth_pro
-from src.pointcloud import point_rendering
+from src.pointcloud import point_rendering, contract_depth
 from src.utils import traj_map, points_padding, np_points_padding, set_initial_camera, build_cameras
+from src.subject_camera import aim_cameras_at_subject, lift_subject_to_world
 from huggingface_hub import hf_hub_download
 
 warnings.filterwarnings("ignore")
@@ -49,6 +50,18 @@ def main():
                         help="Focal length, range 0.25 to 2.5; changing focal length zooms in and out")
     parser.add_argument("--start_elevation", default=5.0, type=float,
                         help="Initial angle, no exceptions to change")
+    parser.add_argument("--subject_pixel", default=None, type=float, nargs=2, metavar=("U", "V"),
+                        help="Subject pixel [u,v] in the EXIF-corrected original reference image; enables subject-centered camera motion")
+    parser.add_argument("--subject_depth", default=None, type=float,
+                        help="Optional positive camera-z override at subject_pixel, in rendered depth units (Depth-Pro: meters); otherwise sample the aligned depth map")
+    parser.add_argument("--subject_depth_radius", default=2, type=int,
+                        help="Median depth patch radius in resized pixels; 0 samples only the nearest pixel")
+    parser.add_argument("--subject_world_up", default=[0.0, -1.0, 0.0], type=float, nargs=3,
+                        help="World-space up direction for look-at; default is camera/world -y")
+    parser.add_argument("--subject_look_at_start", default=0.1, type=float,
+                        help="Fraction of trajectory spent smoothly turning from the original view to subject-centered look-at; 0 turns immediately after frame 0")
+    parser.add_argument("--subject_keep_upright", action="store_true",
+                        help="Use subject_world_up (default world -y) instead of retaining the source camera's up direction")
 
     args = parser.parse_args()
     device = "cuda"
@@ -126,6 +139,33 @@ def main():
     pcd = trimesh.PointCloud(vertices=points3d, colors=colors)
     _ = pcd.export(f"{args.output_path}/pcd.ply")
 
+    # The original trajectory uses the world origin at foreground depth as its
+    # center. Shift the entire orbit to a clicked subject's 3D position instead;
+    # the initial camera position and all preset/custom parameters stay intact.
+    subject_info = None
+    orbit_center = None
+    if args.subject_pixel is not None:
+        # Use the same pixel-center convention and far-depth contraction as
+        # point_rendering, rather than the export-only integer-coordinate path.
+        render_depth = depth.detach().cpu().clone()
+        if render_depth.max() > 0:
+            render_depth = contract_depth(render_depth)
+        source_subject_info = lift_subject_to_world(
+            args.subject_pixel, depth.detach().cpu().numpy(), K.numpy(), c2w_0.numpy(),
+            source_size=(w_origin, h_origin), sample_radius=args.subject_depth_radius,
+        )
+        subject_info = lift_subject_to_world(
+            args.subject_pixel, render_depth.numpy(), K.numpy(), c2w_0.numpy(),
+            source_size=(w_origin, h_origin), depth_override=args.subject_depth,
+            sample_radius=args.subject_depth_radius,
+        )
+        subject_info["source_camera_z"] = source_subject_info["depth"]
+        orbit_center = subject_info["world_point"]
+        print(f"Subject pixel: {subject_info['source_pixel'].tolist()} -> "
+              f"{subject_info['resized_pixel'].tolist()}, camera-z: {subject_info['depth']:.6f}")
+        print(f"Subject world point: {orbit_center.tolist()}")
+        print(f"Subject source camera-z (before renderer far-depth contraction): {source_subject_info['depth']:.6f}")
+
     # build camera viewpoints according to d_theta，d_phi, d_r
     w2cs, c2ws, intrinsic = build_cameras(cam_traj=cam_traj,
                                           w2c_0=w2c_0,
@@ -139,13 +179,45 @@ def main():
                                           radius=depth_avg,
                                           x_offset=x_offset,
                                           y_offset=y_offset,
-                                          z_offset=z_offset)
-
+                                          z_offset=z_offset,
+                                          orbit_center=orbit_center)
+    if subject_info is not None:
+        world_up = np.asarray(args.subject_world_up, dtype=np.float64) if args.subject_keep_upright else None
+        c2ws = torch.from_numpy(aim_cameras_at_subject(
+            c2ws.numpy(), subject_info["world_point"], world_up,
+            ramp_fraction=args.subject_look_at_start,
+        )).to(c2ws.dtype)
+        w2cs = torch.linalg.inv(c2ws)
+        if not torch.isfinite(w2cs).all():
+            raise ValueError("Subject camera trajectory contains NaN or infinity.")
     # save camera infos
     w2cs_list = w2cs.cpu().numpy().tolist()
-    camera_infos = {"intrinsic": K.cpu().numpy().tolist(), "extrinsic": w2cs_list, "height": height, "width": width}
+    camera_infos = {
+        "intrinsic": K.cpu().numpy().tolist(),
+        # Original single-K field remains for backward-compatible consumers.
+        # This optional dense field exactly matches the per-frame rendering K,
+        # including the existing focal_length ramp.
+        "per_frame_intrinsic": intrinsic.cpu().numpy().tolist(),
+        "extrinsic": w2cs_list, "height": height, "width": width,
+    }
+    if subject_info is not None:
+        camera_infos["subject"] = {
+            key: value.tolist() if isinstance(value, np.ndarray) else value
+            for key, value in subject_info.items()
+        }
+        camera_infos["subject"]["world_up"] = (
+            args.subject_world_up if args.subject_keep_upright
+            else (-c2w_0.numpy()[:3, 1]).tolist()
+        )
+        camera_infos["subject"]["look_at_ramp_fraction"] = args.subject_look_at_start
+        camera_infos["subject"]["source_depth"] = subject_info["source_camera_z"]
+        camera_infos["subject"]["render_depth"] = subject_info["depth"]
+        camera_infos["subject"]["initial_c2w"] = c2w_0.numpy().tolist()
     with open(f"{args.output_path}/cam_info.json", "w") as writer:
         json.dump(camera_infos, writer, indent=2)
+    if subject_info is not None:
+        with open(f"{args.output_path}/subject_info.json", "w", encoding="utf-8") as writer:
+            json.dump(camera_infos["subject"], writer, indent=2)
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
         control_imgs, render_masks = point_rendering(K=intrinsic.float(),

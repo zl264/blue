@@ -74,6 +74,58 @@ We also support `traj_type` to define camera trajectories: `"custom", "free1", "
 
 We recommend to read [ViewCrafter](https://github.com/Drexubery/ViewCrafter/blob/main/docs/gradio_tutorial.md) for more detailed hyper-parameter introduction about the camera control
 
+#### Subject-centered camera motion (added extension)
+
+See [docs/subject_centered_camera.md](docs/subject_centered_camera.md) for the
+complete Chinese guide, geometry conventions, parameters, modified files and
+verification status.
+
+Pass `--subject_pixel U V` to make any existing trajectory orbit around a clicked
+subject instead of the default foreground center. The coordinate is in the
+**EXIF-corrected original input image**, not the resized render. Depth-Pro's
+aligned camera-z depth and the estimated intrinsics lift that pixel to a 3D point.
+The original seven parameters and all `traj_type` presets still work. After frame
+0, the camera smoothly turns to look at the subject; frame 0 keeps the original
+pose rather than abruptly rotating an off-center subject.
+
+```bash
+# Orbit 90 degrees to the left around the clicked subject.
+python cam_render.py --reference_image "data/demo/flux-0.png" \
+                     --output_path "outputs/subject_orbit" \
+                     --subject_pixel 520 360 \
+                     --traj_type custom --d_phi -90 --d_r 1.0
+
+# Use an existing preset, or combine orbit, elevation, dolly and zoom.
+python cam_render.py --reference_image "data/demo/flux-0.png" \
+                     --output_path "outputs/subject_combined" \
+                     --subject_pixel 520 360 \
+                     --traj_type custom --d_phi -60 --d_theta -10 \
+                     --d_r 0.75 --focal_length 1.1
+
+# A full 360-degree orbit also supports the subject center.
+python cam_render.py --reference_image "data/demo/flux-0.png" \
+                     --output_path "outputs/subject_360" \
+                     --subject_pixel 520 360 --traj_type orbit
+```
+
+Depth is sampled from a small neighborhood by default. Use
+`--subject_depth_radius 0` for nearest-pixel sampling, or `--subject_depth Z` to
+override it with a positive camera-z value in rendered depth units (meters for
+Depth-Pro). Do not multiply this override by the image-resize factor. Clicking a
+depth discontinuity may select the background; inspect `subject_info.json` and
+the rendered video. `--subject_keep_upright` uses world `-y` as the up reference;
+by default the source camera's up direction is retained. Increase
+`--subject_look_at_start` (0 to 1, default 0.1) to lengthen the initial smooth
+turn toward the subject. At `0`, every frame after frame 0 uses exact subject
+look-at. The exported `per_frame_intrinsic` preserves the existing focal-length
+ramp for the optional ray embedding, while the legacy `intrinsic` field remains.
+
+The extension adds `subject_info.json` and records the selected subject/camera
+metadata in `cam_info.json`. It does not change PCDController or the render/mask
+interface, so Stage 2 commands are unchanged. A monocular first-frame point cloud
+cannot reconstruct unseen backsides; large orbits still require the video model
+to fill holes and may produce artifacts.
+
 ```
 python cam_render.py --reference_image "data/demo/flux-0.png" \
                      --output_path "outputs/demo_0" \

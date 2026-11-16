@@ -198,14 +198,27 @@ def set_initial_camera(start_elevation, radius):
 
 
 def build_cameras(cam_traj, w2c_0, c2w_0, intrinsic, nframe, focal_length,
-                  d_theta, d_phi, d_r, radius, x_offset, y_offset, z_offset):
+                  d_theta, d_phi, d_r, radius, x_offset, y_offset, z_offset,
+                  orbit_center=None):
     # build camera viewpoints according to d_theta，d_phi, d_r
     # return: w2cs:[V,4,4], c2ws:[V,4,4], intrinsic:[V,3,3]
+    # orbit_center optionally replaces the world origin without changing the
+    # original trajectory conventions. It is a 3D point in c2w world units.
+    if orbit_center is not None:
+        orbit_center = torch.as_tensor(orbit_center, dtype=c2w_0.dtype, device=c2w_0.device)
+        if orbit_center.shape != (3,) or not torch.isfinite(orbit_center).all():
+            raise ValueError("orbit_center must be a finite 3D point.")
     if intrinsic.ndim == 2:
         intrinsic = intrinsic[None].repeat(nframe, 1, 1)
 
     c2ws = [c2w_0]
     w2cs = [w2c_0]
+    # Recenter the *initial camera-to-origin vector*, not just the final
+    # trajectory. This preserves the source camera's radius around an arbitrary
+    # clicked point at frame 0 and at d_r=1.
+    c2w_base = c2w_0.clone()
+    if orbit_center is not None:
+        c2w_base[:3, -1] -= orbit_center
     d_thetas, d_phis, d_rs = [], [], []
     x_offsets, y_offsets, z_offsets = [], [], []
     if cam_traj == "free":
@@ -255,10 +268,12 @@ def build_cameras(cam_traj, w2c_0, c2w_0, intrinsic, nframe, focal_length,
                               [0, 1, 0, 0],
                               [-np.sin(d_phi_rad), 0, np.cos(d_phi_rad), 0],
                               [0, 0, 0, 1]], dtype=torch.float32)
-        c2w_1 = R_phi @ R_theta @ c2w_0
+        c2w_1 = R_phi @ R_theta @ c2w_base
         if i < len(x_offsets) and i < len(y_offsets) and i < len(z_offsets):
             c2w_1[:3, -1] += torch.tensor([x_offsets[i], y_offsets[i], z_offsets[i]])
         c2w_1[:3, -1] *= d_rs[i]
+        if orbit_center is not None:
+            c2w_1[:3, -1] += orbit_center
         w2c_1 = c2w_1.inverse()
         c2ws.append(c2w_1)
         w2cs.append(w2c_1)
