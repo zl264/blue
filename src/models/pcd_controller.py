@@ -6,12 +6,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.transformers.transformer_wan import WanTransformer3DModel, WanRotaryPosEmbed
+from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
 from huggingface_hub import hf_hub_download
-from xfuser.core.distributed import get_sequence_parallel_rank, get_sp_group
+from src.accelerator import autocast_for
+from src.models.controlnet import (
+    DeviceWanRotaryPosEmbed, WanXControlNet, configure_device_attention, zero_module,
+)
 
-from src.models.controlnet import zero_module, WanXControlNet
+if os.getenv("WORLD_SIZE", "1") != "1":
+    from xfuser.core.distributed import get_sequence_parallel_rank, get_sp_group
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -87,15 +91,31 @@ class PCDController(WanTransformer3DModel):
         self.rope_max_seq_len = rope_max_seq_len
         self.sp_size = 1
 
+    @property
+    def dtype(self):
+        # PEFT can add FP32 LoRA parameters to an otherwise BF16 Wan model.
+        # ModelMixin.dtype would then report FP32 and break mixed-precision
+        # training/inference, so anchor the dtype on the frozen patch embedding.
+        return self.patch_embedding.weight.dtype
+
     def build_controlnet(self, model_path, logger=None):
         # controlnet
         self.controlnet_patch_embedding = nn.Conv3d(
             self.in_channels, self.controlnet_cfg.conv_out_dim, kernel_size=self.patch_size, stride=self.patch_size
         )
+        if self.in_channels != 36:
+            raise ValueError("Uni3C static training requires Wan I2V in_channels=36 (16 noisy + 20 condition)")
         self.controlnet_mask_embedding = MaskCamEmbed(self.controlnet_cfg)
         self.controlnet = WanXControlNet(self.controlnet_cfg)
-        self.controlnet_rope = WanRotaryPosEmbed(self.controlnet_cfg.dim // self.controlnet_cfg.num_heads,
-                                                 self.patch_size, self.rope_max_seq_len)
+        self.controlnet_rope = DeviceWanRotaryPosEmbed(
+            self.controlnet_cfg.dim // self.controlnet_cfg.num_heads,
+            self.patch_size, self.rope_max_seq_len,
+        )
+        # from_pretrained casts existing Wan modules to BF16, but modules built
+        # afterwards start in FP32. State that contract explicitly for both the
+        # original inference path and cached static-scene training.
+        self.controlnet_patch_embedding.float()
+        self.controlnet_mask_embedding.float()
 
         if not os.path.exists(model_path):  # download weights from huggingface
             model_path = hf_hub_download(repo_id="ewrfcas/Uni3C", filename=model_path, repo_type="model")
@@ -131,35 +151,64 @@ class PCDController(WanTransformer3DModel):
         else:
             lora_scale = 1.0
 
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
+        if USE_PEFT_BACKEND and lora_scale != 1.0:
             scale_lora_layers(self, lora_scale)
-        else:
-            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
-                )
+        try:
+            return self._forward(
+                hidden_states=hidden_states, timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+                render_latent=render_latent, render_mask=render_mask,
+                camera_embedding=camera_embedding, return_dict=return_dict,
+            )
+        finally:
+            if USE_PEFT_BACKEND and lora_scale != 1.0:
+                unscale_lora_layers(self, lora_scale)
 
+    def _forward(
+            self, hidden_states, timestep, encoder_hidden_states,
+            encoder_hidden_states_image=None, render_latent=None,
+            render_mask=None, camera_embedding=None, return_dict=True,
+    ):
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
+        if hidden_states.ndim != 5 or num_channels != self.in_channels:
+            raise ValueError(f"hidden_states must be [B,{self.in_channels},F,H,W] for Wan I2V")
+        if render_latent is None or render_latent.shape != (batch_size, 16, num_frames, height, width):
+            raise ValueError("render_latent must be [B,16,F,latent_H,latent_W]")
+        if render_mask is None or render_mask.ndim != 5 or render_mask.shape[0] != batch_size or render_mask.shape[1] != 1:
+            raise ValueError("render_mask must be [B,1,F,H,W]")
+        if camera_embedding is not None and (
+            camera_embedding.ndim != 5 or camera_embedding.shape[1] != 6
+        ):
+            raise ValueError("camera_embedding must be [B,6,F,H,W]")
 
         ### process controlnet inputs ###
-        render_latent = torch.cat([hidden_states[:, :20], render_latent], dim=1)
-        controlnet_rotary_emb = self.controlnet_rope(render_latent)
-        controlnet_inputs = self.controlnet_patch_embedding(render_latent)
+        # The dynamically built controller starts in FP32. Keep its render/mask
+        # inputs FP32 too, then enter the BF16 Wan token path. Uni3C's control
+        # embedding consumes the first 20 channels (16 noisy latent + first
+        # four I2V condition channels) plus the 16-channel render latent.
+        # Thus both patch-embedding Conv3d layers have self.in_channels=36.
+        condition = hidden_states[:, :20].float()
+        hidden_states = hidden_states.to(self.dtype)
+        control_input = torch.cat([condition, render_latent.float()], dim=1)
+        controlnet_rotary_emb = self.controlnet_rope(control_input)
+        controlnet_inputs = self.controlnet_patch_embedding(control_input)
         controlnet_inputs = controlnet_inputs.flatten(2).transpose(1, 2)
 
         # additional inputs (mask, camera embedding)
+        render_mask = render_mask.float()
+        camera_embedding = camera_embedding.float() if camera_embedding is not None else None
         if camera_embedding is not None:
             add_inputs = torch.cat([render_mask, camera_embedding], dim=1)
         else:
             add_inputs = render_mask
         add_inputs = self.controlnet_mask_embedding(add_inputs)
-        controlnet_inputs = controlnet_inputs + add_inputs
-        ### process controlnet inputs over ###
+        controlnet_inputs = (controlnet_inputs + add_inputs).to(self.dtype)
+        controlnet_rotary_emb = controlnet_rotary_emb.to(hidden_states.device)
 
         rotary_emb = self.rope(hidden_states)
 
@@ -180,7 +229,7 @@ class PCDController(WanTransformer3DModel):
             controlnet_inputs = torch.chunk(controlnet_inputs, self.sp_size, dim=1)[get_sequence_parallel_rank()]
             controlnet_rotary_emb = torch.chunk(controlnet_rotary_emb, self.sp_size, dim=2)[get_sequence_parallel_rank()]
 
-        with torch.autocast("cuda", dtype=self.dtype, enabled=True):
+        with autocast_for(hidden_states, dtype=self.dtype, enabled=True):
             controlnet_states = self.controlnet(hidden_states=controlnet_inputs,
                                                 temb=temb,
                                                 rotary_emb=controlnet_rotary_emb)
@@ -228,10 +277,6 @@ class PCDController(WanTransformer3DModel):
         )
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-
-        if USE_PEFT_BACKEND:
-            # remove `lora_scale` from each PEFT layer
-            unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
             return (output,)

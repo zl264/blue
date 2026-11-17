@@ -1,11 +1,123 @@
 from typing import Optional
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models import ModelMixin
 from diffusers.models.attention_processor import Attention
-from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed
+
+
+class DeviceWanRotaryPosEmbed(WanRotaryPosEmbed):
+    """Generate RoPE on CPU on Ascend instead of materializing complex128 there.
+
+    The frequency table is precomputed in the official module. Slicing and grid
+    construction use ordinary CPU tensors; only the final complex64 table is
+    transferred to NPU. CUDA retains the original complex128 computation.
+    """
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.device.type != "npu":
+            return super().forward(hidden_states)
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
+        freqs = self.freqs.cpu().to(torch.complex64).split_with_sizes(
+            [
+                self.attention_head_dim // 2 - 2 * (self.attention_head_dim // 6),
+                self.attention_head_dim // 6,
+                self.attention_head_dim // 6,
+            ],
+            dim=1,
+        )
+        freqs_f = freqs[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_h = freqs[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_w = freqs[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+        freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(
+            1, 1, ppf * pph * ppw, -1,
+        )
+        if ppf > self.max_seq_len or max(pph, ppw) > self.max_seq_len:
+            raise ValueError("RoPE grid exceeds the configured rope_max_seq_len")
+        return freqs.to(hidden_states.device)
+
+
+def apply_rotary_emb(hidden_states, freqs):
+    # complex128 is not generally supported by torch_npu. Keep the original
+    # float64 path on CUDA and use complex64 on Ascend. Casting the frequencies
+    # is required too: complex64 * complex128 promotes back to complex128.
+    compute_dtype = torch.float32 if hidden_states.device.type == "npu" else torch.float64
+    x_rotated = torch.view_as_complex(hidden_states.to(compute_dtype).unflatten(3, (-1, 2)))
+    x_out = torch.view_as_real(x_rotated * freqs.to(x_rotated.dtype)).flatten(3, 4)
+    return x_out.type_as(hidden_states)
+
+
+class WanAttnProcessorNPU:
+    """Official Wan attention with complex64 RoPE for single-device Ascend."""
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("Wan attention requires PyTorch 2.0+")
+
+    def __call__(
+            self, attn: Attention, hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states_img = None
+        if attn.add_k_proj is not None:
+            encoder_hidden_states_img = encoder_hidden_states[:, :257]
+            encoder_hidden_states = encoder_hidden_states[:, 257:]
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        if rotary_emb is not None:
+            query = apply_rotary_emb(query, rotary_emb)
+            key = apply_rotary_emb(key, rotary_emb)
+
+        hidden_states_img = None
+        if encoder_hidden_states_img is not None:
+            key_img = attn.add_k_proj(encoder_hidden_states_img)
+            key_img = attn.norm_added_k(key_img)
+            value_img = attn.add_v_proj(encoder_hidden_states_img)
+            key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            value_img = value_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            hidden_states_img = F.scaled_dot_product_attention(
+                query, key_img, value_img, dropout_p=0.0, is_causal=False,
+            ).transpose(1, 2).flatten(2, 3).type_as(query)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False,
+        ).transpose(1, 2).flatten(2, 3).type_as(query)
+        if hidden_states_img is not None:
+            hidden_states = hidden_states + hidden_states_img
+        hidden_states = attn.to_out[0](hidden_states)
+        return attn.to_out[1](hidden_states)
+
+
+def configure_device_attention(transformer, device):
+    """Replace only main-Wan RoPE on NPU; preserve CUDA's original math."""
+    if torch.device(device).type != "npu":
+        return
+    transformer.rope = DeviceWanRotaryPosEmbed(
+        transformer.rope.attention_head_dim, transformer.rope.patch_size, transformer.rope.max_seq_len,
+    )
+    for block in transformer.blocks:
+        block.attn1.set_processor(WanAttnProcessorNPU())
+        block.attn2.set_processor(WanAttnProcessorNPU())
+
+
+if os.getenv("WORLD_SIZE", "1") != "1":
+    from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
 
 def zero_module(module):
@@ -50,11 +162,6 @@ class WanAttnProcessorSP:
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
 
         if rotary_emb is not None:
-            def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
-                x_rotated = torch.view_as_complex(hidden_states.to(torch.float64).unflatten(3, (-1, 2)))
-                x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
-                return x_out.type_as(hidden_states)
-
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
 
@@ -128,11 +235,6 @@ class SimpleAttnProcessor2_0:
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)  # [b,head,l,c]
 
         if rotary_emb is not None:
-            def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
-                x_rotated = torch.view_as_complex(hidden_states.to(torch.float64).unflatten(3, (-1, 2)))
-                x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
-                return x_out.type_as(hidden_states)
-
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
 

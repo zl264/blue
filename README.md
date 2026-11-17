@@ -49,6 +49,23 @@ cd ../GeoCalib && pip install -e .
 cd ../..
 ```
 
+### Ascend 910B2 static-scene fine-tuning (added extension)
+
+For camera motion without autonomous subject/background motion, see the Chinese
+[910B2 static-scene training and inference guide](docs/ascend_static_scene.md).
+Before preparing a dataset, read the [static-scene data and coordinate-system
+specification](docs/static_scene_data.md). It defines the `w2c`/`c2w` direction,
+OpenCV camera axes, render-world construction, pixel-center conventions,
+intrinsic scaling, `subject_pixel`, real-trajectory alignment, directory layout
+and acceptance checks. In particular, `cam_render.py` does not estimate a camera
+trajectory from an arbitrary target video.
+The training guide provides frozen-encoder caching, control-only LoRA fine-tuning,
+NPU device selection and `--static_lora` inference. The implementation targets
+single-card 910B2 with CPU offload; real CANN/torch_npu compatibility, memory use,
+training convergence and final static-scene quality still require on-device validation.
+Point-cloud preprocessing remains separate because PyTorch3D and MoGe's
+Triton/FlexGEMM path are not Ascend-native.
+
 ## Camera control inference
 
 ### Commercial depth backends (added extension)

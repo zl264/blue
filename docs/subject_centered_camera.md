@@ -56,7 +56,7 @@ CUDA_VISIBLE_DEVICES=0 python cam_control.py \
 
 ## 3. 几何与坐标约定
 
-统一采用 OpenCV 相机坐标：x 右、y 下、z 前；位姿为 `c2w`，深度为正相机 z 深度。
+统一采用 OpenCV 相机坐标：x 右、y 下、z 前；位姿为 `c2w`，深度为正相机 z 深度。完整训练数据契约、`cam_info.json` 的 **w2c** 外参方向、外部标定转换和验收方法见 [静态场景数据与坐标系规范](static_scene_data.md)。
 
 ### 3.1 点击坐标缩放
 

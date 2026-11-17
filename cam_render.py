@@ -14,6 +14,7 @@ from pytorch3d.renderer import PointsRasterizationSettings
 from torchvision.transforms import ToTensor, ToPILImage
 
 from src.depth_estimation import create_depth_estimator
+from src.accelerator import empty_cache, setup_device
 from src.pointcloud import point_rendering, contract_depth
 from src.utils import traj_map, points_padding, np_points_padding, set_initial_camera, build_cameras
 from src.subject_camera import aim_cameras_at_subject, lift_subject_to_world
@@ -59,6 +60,8 @@ def main():
                         help="MoGe-3 sparse volumetric refinement steps; 3 follows the official default")
     parser.add_argument("--depth_fp16", action="store_true",
                         help="Use MoGe mixed precision; validate geometry before production use")
+    parser.add_argument("--device", default="auto", choices=["auto", "npu", "cuda", "cpu"],
+                        help="Ascend host: use cpu + depth-pro with CPU PyTorch3D; MoGe-3 Triton path is CUDA-oriented")
     parser.add_argument("--subject_pixel", default=None, type=float, nargs=2, metavar=("U", "V"),
                         help="Subject pixel [u,v] in the EXIF-corrected original reference image; enables subject-centered camera motion")
     parser.add_argument("--subject_depth", default=None, type=float,
@@ -75,7 +78,9 @@ def main():
     args = parser.parse_args()
     if args.depth_refine_steps < 0:
         raise ValueError("depth_refine_steps must be nonnegative.")
-    device = "cuda"
+    device = setup_device(args.device)
+    if device.type == "cpu" and args.depth_model != "depth-pro":
+        raise ValueError("CPU preprocessing currently supports --depth_model depth-pro. MoGe-3 needs a validated CUDA/Triton environment.")
     print(f"Init depth model: {args.depth_model}")
     depth_estimator = create_depth_estimator(
         args.depth_model, device=device, checkpoint=args.depth_checkpoint,
@@ -117,7 +122,7 @@ def main():
           f"invalid pixels conservatively filled: {depth_prediction.filled_pixels}; "
           f"fx/fy: {K[0,0].item():.3f}/{K[1,1].item():.3f}")
     del depth_estimator
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     os.makedirs(args.output_path, exist_ok=True)
 
@@ -244,7 +249,7 @@ def main():
         with open(f"{args.output_path}/subject_info.json", "w", encoding="utf-8") as writer:
             json.dump(camera_infos["subject"], writer, indent=2)
 
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+    with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
         control_imgs, render_masks = point_rendering(K=intrinsic.float(),
                                                      w2cs=w2cs.float(),
                                                      depth=depth.float(),

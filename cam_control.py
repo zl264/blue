@@ -10,11 +10,11 @@ from diffusers.utils import export_to_video
 from huggingface_hub import hf_hub_download
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
-from xfuser.core.distributed import get_sequence_parallel_world_size
 
+from src.accelerator import empty_cache, init_distributed, sequence_parallel_world_size, setup_device
 from src.dataset import load_dataset
 from src.fsdp import shard_model
-from src.models.controlnet import WanAttnProcessorSP
+from src.models.controlnet import WanAttnProcessorSP, configure_device_attention
 from src.models.pcd_controller import PCDController
 from src.pipelines.pipeline_pcd import PCDControllerPipeline
 from src.utils import create_logger, is_main_process
@@ -33,20 +33,24 @@ if __name__ == '__main__':
                         type=str, help="Prompt of the reference image")
     parser.add_argument("--max_area", default=480 * 768, type=int, help="Total pixel area of height * width")
     parser.add_argument("--seed", default=1024, type=int, help="random seed")
+    parser.add_argument("--device", default="auto", choices=["auto", "npu", "cuda", "cpu"],
+                        help="Use --device npu on Ascend 910B2; auto prefers NPU over CUDA")
+    parser.add_argument("--static_lora", default=None, type=str,
+                        help="Directory saved by train_static_lora.py, e.g. outputs/static_lora/latest")
+    parser.add_argument("--lora_scale", default=1.0, type=float,
+                        help="Static-scene LoRA strength; try 0.5-1.0 if identity/geometry degrades")
     args = parser.parse_args()
 
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{local_rank}")
+    if (args.enable_sp or args.fsdp) and world_size == 1:
+        raise ValueError("SP/FSDP require multiple devices; single 910B2 uses CPU offload")
+    device = setup_device(args.device, local_rank)
     if world_size > 1:
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            rank=rank,
-            world_size=world_size
-        )
+        if device.type not in ("npu", "cuda"):
+            raise ValueError("Multi-device inference requires NPU or CUDA")
+        init_distributed(device)
 
     cfg = OmegaConf.load(hf_hub_download(repo_id="ewrfcas/Uni3C", filename="config.json"))
     # == init logger ==
@@ -74,19 +78,27 @@ if __name__ == '__main__':
     transformer = PCDController.from_pretrained(base_model_id, subfolder="transformer", controlnet_cfg=cfg.controlnet_cfg, torch_dtype=torch.bfloat16)
     logger.info("loading controlnet...")
     transformer.build_controlnet(model_path="controlnet.pth", logger=logger)
+    if args.static_lora:
+        from src.training import load_lora
+        transformer = load_lora(transformer, args.static_lora)
+        logger.info(f"Loaded static-scene LoRA: {args.static_lora}; scale={args.lora_scale}")
+    transformer.enable_gradient_checkpointing()
+    transformer.controlnet.gradient_checkpointing = True
     if args.enable_sp:  # replace attention_processor for DiT
-        transformer.sp_size = get_sequence_parallel_world_size()
+        transformer.sp_size = sequence_parallel_world_size()
         for layer in transformer.controlnet.controlnet_blocks:
-            layer.self_attn.processor.sp_size = get_sequence_parallel_world_size()
+            layer.self_attn.processor.sp_size = sequence_parallel_world_size()
         for block in transformer.blocks:
-            block.attn1.set_processor(WanAttnProcessorSP(sp_size=get_sequence_parallel_world_size()))
-
+            block.attn1.set_processor(WanAttnProcessorSP(sp_size=sequence_parallel_world_size()))
+            block.attn2.set_processor(WanAttnProcessorSP(sp_size=sequence_parallel_world_size()))
+    else:
+        configure_device_attention(transformer, device)
     if args.enable_sp and args.fsdp:
         if dist.is_initialized():
             dist.barrier()
         transformer = shard_model(transformer, device_id=local_rank, model_type="wan", use_orig_params=True)
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache(device)
         logger.info("Finish warp DiT for FSDP...")
 
     text_encoder = UMT5EncoderModel.from_pretrained(base_model_id, subfolder="text_encoder", torch_dtype=torch.bfloat16)
@@ -95,7 +107,7 @@ if __name__ == '__main__':
             dist.barrier()
         text_encoder = shard_model(text_encoder, device_id=local_rank, model_type="t5", use_orig_params=True)
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache(device)
         logger.info("Finish warp T5 for FSDP...")
 
     image_clip = CLIPVisionModel.from_pretrained(base_model_id, subfolder="image_encoder", torch_dtype=torch.float32)
@@ -104,7 +116,7 @@ if __name__ == '__main__':
             dist.barrier()
         image_clip = shard_model(image_clip, device_id=local_rank, model_type="clip", use_orig_params=True)
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache(device)
         logger.info("Finish warp CLIP for FSDP...")
 
     vae = AutoencoderKLWan.from_pretrained(base_model_id, subfolder="vae", torch_dtype=torch.float32)
@@ -121,10 +133,9 @@ if __name__ == '__main__':
         scheduler=UniPCMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
     )
 
-    # replace this with pipe.to("cuda") if you have sufficient VRAM
-    if not args.enable_sp or not args.fsdp:
-        # pipe.to("cuda")
-        pipe.enable_model_cpu_offload(gpu_id=local_rank, device="cuda")
+    # CPU offload avoids requiring the full 14B model and encoders on one NPU.
+    if not (args.enable_sp or args.fsdp):
+        pipe.enable_model_cpu_offload(gpu_id=local_rank, device=device.type)
 
     image, render_video, render_mask, camera_embedding, height, width = load_dataset(
         reference_image=args.reference_image,
@@ -134,7 +145,7 @@ if __name__ == '__main__':
         pipe=pipe,
         use_camera_embedding=cfg.get("camera_embedding", False),
         device=device,
-        sp_degree=get_sequence_parallel_world_size() if args.enable_sp else 1,
+        sp_degree=sequence_parallel_world_size() if args.enable_sp else 1,
         logger=logger
     )
 
@@ -144,7 +155,7 @@ if __name__ == '__main__':
         image=image,
         render_video=render_video.to(device),
         render_mask=render_mask.to(device),
-        camera_embedding=camera_embedding.to(device),
+        camera_embedding=camera_embedding.to(device) if camera_embedding is not None else None,
         prompt=(args.prompt),
         negative_prompt="",
         height=height,
@@ -152,6 +163,7 @@ if __name__ == '__main__':
         num_frames=args.nframe,
         guidance_scale=5.0,
         generator=gen,
+        attention_kwargs={"scale": args.lora_scale} if args.static_lora else None,
     ).frames[0]
 
     if is_main_process():

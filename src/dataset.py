@@ -25,12 +25,16 @@ def load_dataset(reference_image, render_path, nframe, max_area, pipe, use_camer
 
     # load conditions
     render_frames = load_video(f"{render_path}/render.mp4")
+    if len(render_frames) != nframe:
+        raise ValueError(f"render.mp4: expected {nframe} frames, got {len(render_frames)}")
     render_video = torch.stack([ToTensor()(frame) for frame in render_frames], dim=0) * 2 - 1.0  # [f,c,h,w]
     render_video = F.interpolate(render_video, size=(height, width), mode='bicubic')[None]
     # replace the first frame with the high-quality reference image
     render_video[0, 0] = ToTensor()(image) * 2 - 1
     render_video = torch.clip(render_video, -1, 1)  # [-1~1], [1,f,c,h,w]
     render_mask_frames = load_video(f"{render_path}/render_mask.mp4")
+    if len(render_mask_frames) != nframe:
+        raise ValueError(f"render_mask.mp4: expected {nframe} frames, got {len(render_mask_frames)}")
     render_mask = torch.stack([ToTensor()(frame) for frame in render_mask_frames], dim=0)[:, 0:1]  # [f,1,h,w]
     render_mask = F.interpolate(render_mask, size=(height, width), mode='nearest')[None]  # [0,1],[1,f,1,h,w]
     render_video = einops.rearrange(render_video, "b f c h w -> b c f h w")
@@ -39,15 +43,24 @@ def load_dataset(reference_image, render_path, nframe, max_area, pipe, use_camer
     render_mask[render_mask >= 0.5] = 1
 
     # load camera
-    cam_info = json.load(open(f"{render_path}/cam_info.json"))
-    w2cs = torch.tensor(np.array(cam_info["extrinsic"]), dtype=torch.float32, device=device)
-    intrinsic = torch.tensor(np.array(cam_info["intrinsic"]), dtype=torch.float32, device=device)
+    with open(f"{render_path}/cam_info.json", encoding="utf-8") as reader:
+        cam_info = json.load(reader)
+    render_height, render_width = render_frames[0].height, render_frames[0].width
+    cam_info.setdefault("width", render_width)
+    cam_info.setdefault("height", render_height)
+    if (cam_info["width"], cam_info["height"]) != (render_width, render_height):
+        raise ValueError("cam_info.json dimensions must match the actual rendered frames")
+    if len(cam_info["extrinsic"]) != nframe:
+        raise ValueError(f"cam_info.json: expected {nframe} camera poses")
+    geometry_device = torch.device("cpu") if torch.device(device).type == "npu" else device
+    w2cs = torch.tensor(np.array(cam_info["extrinsic"]), dtype=torch.float32, device=geometry_device)
+    intrinsic = torch.tensor(np.array(cam_info["intrinsic"]), dtype=torch.float32, device=geometry_device)
     intrinsic[0, :] = intrinsic[0, :] / cam_info["width"] * width
     intrinsic[1, :] = intrinsic[1, :] / cam_info["height"] * height
     if "per_frame_intrinsic" in cam_info:
         # New render outputs may carry a focal-length trajectory. Preserve the
         # original single-K behavior for older outputs.
-        intrinsic = torch.tensor(np.array(cam_info["per_frame_intrinsic"]), dtype=torch.float32, device=device)
+        intrinsic = torch.tensor(np.array(cam_info["per_frame_intrinsic"]), dtype=torch.float32, device=geometry_device)
         intrinsic[:, 0, :] = intrinsic[:, 0, :] / cam_info["width"] * width
         intrinsic[:, 1, :] = intrinsic[:, 1, :] / cam_info["height"] * height
         if intrinsic.shape[0] != nframe:
