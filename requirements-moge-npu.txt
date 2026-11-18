@@ -1,0 +1,6 @@
+# Install with: pip install --no-deps -r requirements-moge-npu.txt
+# Keep the separately installed Ascend torch/torchvision/torch-npu and NumPy 1.26.4.
+# No flex-gemm, Triton, xFormers or CUDA wheels: NPU uses dense MoGe-3 only.
+moge @ git+https://github.com/microsoft/MoGe.git@74fbce054ebed49800de42d0ad0e83495065719a
+utils3d_moge @ git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37
+carvekit @ git+https://github.com/OPHoperHPO/image-background-remove-tool.git@f141a311af67fb1da64269c508a6d1f786420801

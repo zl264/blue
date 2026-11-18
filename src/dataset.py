@@ -52,7 +52,9 @@ def load_dataset(reference_image, render_path, nframe, max_area, pipe, use_camer
         raise ValueError("cam_info.json dimensions must match the actual rendered frames")
     if len(cam_info["extrinsic"]) != nframe:
         raise ValueError(f"cam_info.json: expected {nframe} camera poses")
-    geometry_device = torch.device("cpu") if torch.device(device).type == "npu" else device
+    # Keep geometric ray construction on the selected device. Video/PIL decoding
+    # is host I/O, not a reason to run the NPU camera calculations on CPU.
+    geometry_device = device
     w2cs = torch.tensor(np.array(cam_info["extrinsic"]), dtype=torch.float32, device=geometry_device)
     intrinsic = torch.tensor(np.array(cam_info["intrinsic"]), dtype=torch.float32, device=geometry_device)
     intrinsic[0, :] = intrinsic[0, :] / cam_info["width"] * width

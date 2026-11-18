@@ -736,8 +736,9 @@ JSONL 每行一个样本；相对路径以 JSONL 所在目录为基准：
 ## 11. 910B2 和训练边界的补充提醒
 
 - 当前静态微调入口使用 Wan2.1 I2V 14B 和 Uni3C 控制器，不是 Wan2.2 5B 的通用训练脚本。
-- 推荐在已验证的 CUDA 环境完成 MoGe/PyTorch3D 点云预处理，再把数据复制到 910B2；PyTorch3D 光栅化没有因为训练适配就自动支持 NPU。
-- 只有 910B2 主机时，可尝试 `--device cpu --depth_model depth-pro`；CPU PyTorch3D/CarveKit 仍需在目标环境验证，MoGe 的 Triton/FlexGEMM 路径不是 CPU 回退。
+- `cam_render.py --device npu` 在选定 NPU 上执行 MoGe-3 dense 深度/内参、CarveKit 分割、点云反投影、主体 lifting、相机轨迹、纯 PyTorch splatting 和 ray embedding；不要求 PyTorch3D，也不会静默回退到 Depth-Pro 或其他模型。`--renderer_backend auto` 在 CUDA 上仍使用原 PyTorch3D。纯 PyTorch 回退的边缘合成和 mask 不保证与 CUDA 逐像素一致，批量生成前应做 A/B。
+- MoGe-3 NPU 路径使用 `src/moge_npu.py` 隔离未使用的稀疏 refiner import，严格加载 dense 权重，使用 FP32 且 `refine_steps=0`。安装固定源码包时必须执行 `pip install --no-deps -r requirements-moge-npu.txt`，不要替换 Ascend 的 torch/torchvision/torch_npu 或 NumPy。PIL、JSON、PLY、视频解码与 FFmpeg 编码是主机文件 I/O；模型 CPU offload 是推理显存选项，二者都不等于把深度、分割或几何计算回退到 CPU。
+- NPU 不支持 `depth-pro`/`moge2-vitl`，这些请求会明确报错；不会因为缺少 Triton、FlexGEMM、xFormers 或 PyTorch3D 而假装完成 NPU 预处理。完整安装、真实权重 smoke test、5/17 帧预处理与训练验证命令见 [910B2 指南](ascend_static_scene.md)。人体动作驱动 `alignment.py`/SMPL mesh renderer 不在本次静态 NPU 适配范围内。
 - 17 帧、小 `max_area`、batch size 1 是首次 smoke test 建议，不是显存或质量达标保证。
 - `--resume_lora` 只恢复 adapter 权重，不恢复 optimizer、scheduler 和精确 step。
 - 本仓库的静态训练/昇腾扩展在当前开发环境中未完成真实 910B2 数值和端到端验证。文档中的坐标约定来自代码核对，不代表训练收敛、HBM 足够或最终静态质量已经达标。

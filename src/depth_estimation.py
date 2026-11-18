@@ -19,15 +19,23 @@ class DepthPrediction:
     valid_mask: torch.Tensor  # [H,W], bool; renderer may use this later
     model_name: str
     filled_pixels: int
+    refine_steps: int | None = None
+    use_fp16: bool = False
 
 
 def create_depth_estimator(name="moge3-vitl", device="cuda", checkpoint=None,
                            refine_steps=3, use_fp16=False):
     """Return an estimator with ``predict(rgb_float_chw) -> DepthPrediction``.
 
-    MoGe is selected explicitly by cam_render.py. Its pip installation is left
-    to the user/environment because FlexGEMM/Triton needs a compatible toolchain.
+    MoGe's pip installation is device-specific. On NPU, src.moge_npu excludes
+    only the unused sparse-refinement module and strictly loads dense weights.
     """
+    device = torch.device(device)
+    if device.type == "npu" and name not in ("moge3-vitl", "moge3-vitg"):
+        raise ValueError(
+            "NPU static preprocessing supports MoGe-3 ViT-L/ViT-G only; "
+            "Depth-Pro and MoGe-2 are not silently substituted."
+        )
     if name == "depth-pro":
         import third_party.depth_pro.depth_pro as depth_pro
         model, transform = depth_pro.create_model_and_transforms(device=device)
@@ -39,6 +47,17 @@ def create_depth_estimator(name="moge3-vitl", device="cuda", checkpoint=None,
     }
     if name not in variants:
         raise ValueError(f"Unknown depth model {name!r}; choose from {['depth-pro', *variants]}.")
+    if device.type in ("npu", "cpu") and name.startswith("moge3"):
+        from src.moge_npu import load_moge3_dense
+
+        if refine_steps != 0:
+            print(f"{device.type.upper()}: disabling MoGe-3 sparse refinement (refine_steps=0).")
+            refine_steps = 0
+        if use_fp16:
+            print(f"{device.type.upper()}: MoGe-3 portable dense inference uses FP32; ignoring depth_fp16.")
+            use_fp16 = False
+        model = load_moge3_dense(checkpoint or variants[name], device, refine_steps=0)
+        return MoGeEstimator(model, name, device, 0, False)
     try:
         if name.startswith("moge3"):
             from moge.model.v3 import MoGeModel
@@ -46,8 +65,9 @@ def create_depth_estimator(name="moge3-vitl", device="cuda", checkpoint=None,
             from moge.model.v2 import MoGeModel
     except ImportError as error:
         raise ImportError(
-            "MoGe is not installed. Follow docs/depth_estimation.md to install "
-            "microsoft/MoGe and its FlexGEMM/Triton dependencies in the Uni3C environment."
+            "MoGe is not installed. Install its Python dependencies without replacing "
+            "the Ascend torch/torch_npu wheels; CUDA-only sparse refinement is disabled "
+            "on NPU. See docs/ascend_static_scene.md for the preprocessing path."
         ) from error
     model = MoGeModel.from_pretrained(checkpoint or variants[name]).to(device).eval()
     return MoGeEstimator(model, name, device, refine_steps, use_fp16)
@@ -90,11 +110,16 @@ class MoGeEstimator:
         kwargs = dict(apply_mask=False, use_fp16=self.use_fp16)
         if self.name.startswith("moge3"):
             kwargs["refine_steps"] = self.refine_steps
-        prediction = self.model.infer(image.to(self.device), **kwargs)
-        depth = prediction["depth"].float().detach().cpu()
-        normalized_k = prediction["intrinsics"].float().detach().cpu()
+        if self.name.startswith("moge3") and self.device.type in ("npu", "cpu"):
+            from src.moge_npu import infer_moge3_dense
+
+            prediction = infer_moge3_dense(self.model, image)
+        else:
+            prediction = self.model.infer(image.to(self.device), **kwargs)
+        depth = prediction["depth"].float().detach()
+        normalized_k = prediction["intrinsics"].float().detach()
         mask = prediction.get("mask")
-        mask = torch.ones_like(depth, dtype=torch.bool) if mask is None else mask.detach().cpu().bool()
+        mask = torch.ones_like(depth, dtype=torch.bool) if mask is None else mask.detach().bool()
         height, width = depth.shape
         if normalized_k.shape != (3, 3):
             raise ValueError(f"MoGe must return one [3,3] K, got {tuple(normalized_k.shape)}.")
@@ -106,7 +131,8 @@ class MoGeEstimator:
         # Use the model's camera-z depth, not Euclidean point-map distance. Its
         # K and z jointly define a pinhole point map consistent with Uni3C.
         depth, valid, filled = repair_depth(depth, mask)
-        return DepthPrediction(depth, intrinsic, valid, self.name, filled)
+        return DepthPrediction(depth, intrinsic, valid, self.name, filled,
+                               refine_steps=self.refine_steps, use_fp16=self.use_fp16)
 
 
 def repair_depth(depth, valid_mask=None):
@@ -117,7 +143,7 @@ def repair_depth(depth, valid_mask=None):
     The original validity mask is returned and recorded; no metric accuracy is
     claimed for filled regions.
     """
-    depth = depth.float().detach().cpu()
+    depth = depth.float().detach()
     if depth.ndim != 2:
         raise ValueError(f"Depth must be [H,W], got {tuple(depth.shape)}.")
     valid = torch.isfinite(depth) & (depth > 0)

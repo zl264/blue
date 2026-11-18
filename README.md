@@ -63,8 +63,13 @@ The training guide provides frozen-encoder caching, control-only LoRA fine-tunin
 NPU device selection and `--static_lora` inference. The implementation targets
 single-card 910B2 with CPU offload; real CANN/torch_npu compatibility, memory use,
 training convergence and final static-scene quality still require on-device validation.
-Point-cloud preprocessing remains separate because PyTorch3D and MoGe's
-Triton/FlexGEMM path are not Ascend-native.
+The static `cam_render.py --device npu` path provides pure-PyTorch point
+splatting, direct NPU CarveKit inference, and a dense-only MoGe-3 loader that
+avoids importing FlexGEMM/Triton. It also executes point backprojection,
+subject/camera geometry and ray embeddings on the selected NPU. See the Ascend
+guide for the pinned `--no-deps` installation and mandatory on-device tests.
+No NPU end-to-end execution has been verified in this environment. Human-pose
+mesh alignment remains a separate, CUDA-oriented workflow.
 
 ## Camera control inference
 

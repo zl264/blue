@@ -16,13 +16,15 @@ from src.subject_camera import (
 class SubjectGeometryTest(unittest.TestCase):
     def test_resize_and_backprojection(self):
         resized = resize_subject_pixel((960, 540), (1920, 1080), (768, 480))
-        np.testing.assert_allclose(resized, [383.7, 215.7])
+        # Continuous input-pixel centers map to continuous output-pixel centers.
+        # 540.5 * 480 / 1080 - 0.5 = 239.722222..., not 215.7.
+        np.testing.assert_allclose(resized, [383.7, 540.5 * 480 / 1080 - 0.5])
         source_k = np.array([[1000., 0., 960.], [0., 1000., 540.], [0., 0., 1.]])
         target_k = np.array([[400., 0., 384.], [0., 400., 240.], [0., 0., 1.]])
         depth = np.full((480, 768), 2.)
         subject = lift_subject_to_world((960, 540), depth, target_k, np.eye(4),
                                         (1920, 1080), sample_radius=0)
-        np.testing.assert_allclose(subject["camera_point"], [-.00225, -.066, 2.])
+        np.testing.assert_allclose(subject["camera_point"], [0.001, 1 / 900, 2.])
         # An override is already in rendered z units; resize never scales it.
         overridden = lift_subject_to_world((960, 540), depth, target_k, np.eye(4),
                                            (1920, 1080), depth_override=3.)
@@ -36,7 +38,8 @@ class SubjectGeometryTest(unittest.TestCase):
         c2w[:3, :3] = look_at_rotation((0., 0., -4.), (0., 0., 0.))
         c2w[:3, 3] = [1., 2., 3.]
         subject = lift_subject_to_world((24, 6), depth, k, c2w, (30, 20), sample_radius=0)
-        expected = c2w[:3, :3] @ np.array([3.6, -1.6, 4.]) + c2w[:3, 3]
+        # Pixel-center sampling rounds to (24,6), so x/z=9.5/30, y/z=-3.5/30.
+        expected = c2w[:3, :3] @ np.array([4 * 9.5 / 30, 4 * -3.5 / 30, 4.]) + c2w[:3, 3]
         np.testing.assert_allclose(subject["world_point"], expected, atol=1e-6)
 
     def test_look_at_projects_subject_to_principal_point(self):
@@ -79,7 +82,7 @@ class SubjectGeometryTest(unittest.TestCase):
         depth = np.ones((10, 10))
         with self.assertRaisesRegex(ValueError, "outside"):
             resize_subject_pixel((10, 0), (10, 10), (10, 10))
-        with self.assertRaisesRegex(ValueError, "positive depth"):
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
             lift_subject_to_world((5, 5), depth, np.eye(3), np.eye(4), (10, 10), depth_override=-1)
         with self.assertRaisesRegex(ValueError, "coincides"):
             look_at_rotation(np.zeros(3), np.zeros(3))

@@ -7,13 +7,14 @@
 本扩展提供：
 
 - 单卡 Ascend 910B2 的 NPU 设备、BF16、HCCL（仅多卡时）和 CPU offload；
+- NPU MoGe 深度配置、CarveKit 分割和纯 PyTorch 点云渲染预处理；
 - 冻结 UMT5、CLIP、Wan VAE 的特征缓存；
 - 冻结 Wan2.1-14B 主干，默认只训练 Uni3C 控制器 LoRA；
 - 保留 `render.mp4`、`render_mask.mp4`、`cam_info.json` 和 ray embedding；
 - 在 `cam_control.py` 中显式加载静态场景 LoRA；
 - CUDA 单卡回退路径。
 
-**当前环境没有 910B2、CANN、PyTorch、diffusers、PEFT、真实模型权重或训练数据，因此只完成 Python AST 与差异/空白静态检查；没有执行张量数值测试、PEFT 保存/加载测试或端到端训练。未宣称已在昇腾上跑通、收敛或达到静态效果。** 第一次运行必须按第 8 节做 smoke test。
+**当前环境没有 910B2、CANN、PyTorch、diffusers、PEFT、真实模型权重或训练数据，因此只完成 Python AST、差异/空白静态检查和 NumPy 主体几何测试；没有执行 Torch/NPU 张量数值测试、PEFT 保存/加载测试或端到端训练。未宣称已在昇腾上跑通、收敛或达到静态效果。** 第一次运行必须按第 8 节做 smoke test。
 
 `alignment.py`/`uni3c_inference.py` 是人体动作驱动入口，目标是让人物跟随 SMPL 动作，**不是本任务的静态人物入口**。本次训练与静态推理由 `prepare_static_cache.py`、`train_static_lora.py` 和 `cam_control.py` 组成。
 
@@ -65,8 +66,13 @@ conda activate uni3c-npu
 pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
 pip install torch-npu==2.6.0.post5
 pip install -r requirements-ascend.txt
+# 以下仅安装固定版本的 Python 包，不允许替换 torch/NumPy 或带入 CUDA 依赖。
+pip install --no-deps -r requirements-moge-npu.txt
+pip install loguru pydantic click tqdm
 python -c "import torch, torch_npu; print(torch.__version__); print(torch_npu.__version__); print(torch.npu.is_available()); print(torch.npu.get_device_name(0))"
 ```
+
+`requirements-moge-npu.txt` 必须用 `--no-deps` 安装，因为 MoGe 官方依赖声明要求 NumPy 2，而本项目昇腾清单固定 NumPy 1.26.4。忽略版本声明不代表已经证明所有依赖兼容，目标机必须执行实际 dense 前向；不要用 `pip check` 的提示为由升级 torch 或 NumPy。该清单不包含 MoGe CLI/Gradio 的可选 `pipeline`，静态脚本不使用它。主机上的 PIL/JSON/PLY/FFmpeg 文件读写和视频解码仍是 I/O 边界；NPU 预处理的几何张量计算和 ray embedding 不再专门转到 CPU。单卡推理的 model CPU offload 是显存管理选项，与预处理设备是两件事。
 
 不要在 NPU 环境安装 `xfuser[flash-attn]`。单卡代码路径不导入 xFuser；CUDA flash-attn wheel 不能用于昇腾。训练建议保留较大的主机内存和 swap，因为 14B 权重加载、CPU offload 和数据缓存都在 NPU 显存之外占用资源。
 
@@ -76,22 +82,75 @@ python -c "import torch, torch_npu; print(torch.__version__); print(torch_npu.__
 - [TorchNPU 安装与快速开始](https://github.com/Ascend/pytorch)
 - [昇腾 CANN 下载](https://www.hiascend.com/cann/download)
 
-## 4. 点云预处理
+## 4. NPU 点云预处理
 
-推荐沿用现有 GPU 工作流生成 `render_path`，然后把结果复制到 910B2 主机。NPU 训练和相机控制推理不需要 PyTorch3D。
-
-如果只有 910B2 主机，可以尝试 CPU 预处理：
+当前 `cam_render.py` 提供 `--device npu` 的完整预处理入口：深度估计、CarveKit 前景分割、点云反投影、轨迹生成和 render/mask 导出都可以在同一张 910B2 上执行。NPU 使用 `src/pointcloud_torch.py` 的纯 PyTorch 分块 z-buffer/splatting 实现，**不再要求 PyTorch3D，也不把 NPU 张量伪装成 CUDA 张量**。
 
 ```bash
-# 需要另行安装支持 CPU 的 PyTorch3D 和 CarveKit；MoGe-3 的 Triton/FlexGEMM 路径不是 CPU 回退。
 python cam_render.py \
-  --device cpu --depth_model depth-pro \
+  --device npu --depth_model moge3-vitl \
   --reference_image data/demo/flux-0.png \
   --output_path outputs/static_scene_000/render \
-  --nframe 17 --traj_type custom --d_phi -15
+  --nframe 17 --traj_type custom --d_phi -15 \
+  --renderer_backend torch \
+  --torch_splat_radius 1 --torch_chunk_size 32768
 ```
 
-这条路径也可能较慢，且本环境未验证 CPU PyTorch3D/CarveKit。不要把 `--device npu` 用在未经适配的 PyTorch3D 点云光栅化上。
+然后继续在 NPU 上缓存、训练和推理，见第 6～8 节。`--renderer_backend auto` 在 NPU/CPU 上选择纯 PyTorch，在 CUDA 上保留原 PyTorch3D。也可以显式选择 `--renderer_backend pytorch3d` 复现已有 CUDA 环境。
+
+**该渲染器是几何兼容回退，不是 PyTorch3D 的逐像素替代。** 它使用像素 footprint、最近 camera-z 深度测试和加权颜色合成；PyTorch3D 使用 NDC 半径、`points_per_pixel=8` 和 alpha 合成，边缘、细边界与 mask 空洞可能不同。批量制作训练集前必须在同一图片/轨迹上对比两种 render/mask。可以调整 `--torch_splat_radius`；`0` 是单点最近邻，`1` 是 3×3 范围。`--torch_chunk_size` 控制临时投影点数量，显存不足时可降到 8192/4096，但速度可能下降。
+
+MoGe-3 的 NPU 路径使用 `src/moge_npu.py`：官方 `moge.model.v3` 即使设置 `refine_steps=0` 也会在 import 时加载 FlexGEMM/Triton，因此加载器在局部 import 作用域隔离未使用的 `sparse_unet`，将 `refiner` 配置置空，保留官方 dense encoder/neck/heads。ViT-g 的 xFormers 探测被禁用，使用其 PyTorch SwiGLU；相机后处理不使用 NPU 不支持的 FP32 autocast。官方 `recover_focal_shift()` 会把降采样点图复制到 CPU 并调用 SciPy，这里替换为相同非线性残差的设备端一维 LM 优化，focal 保持闭式最优解；避免深度点图/内参后处理中途回主机。加载器用 `strict=True` 校验全部 dense checkpoint 权重，只排除不会执行的 `refiner.*`；缺权重或结构不匹配会失败，不会保留随机 dense 参数。当前固定 MoGe 提交见 `requirements-moge-npu.txt`，升级后需重新审查该 import 假设。
+
+NPU 不执行稀疏细化，即使命令传入默认 `depth_refine_steps=3` 也会打印提示并使用 `0`，`cam_info.json` 记录实际生效的值。NPU dense 使用 FP32。CarveKit 直接调用 TracerDecoder，绕过其只识别 CUDA/CPU 的官方 autocast 包装器。
+
+当前环境没有 torch/torch_npu、CANN、MoGe 权重或 910B2，以上路径**尚未完成真机算子、显存、速度和精度验证**。设备端 LM 与官方 SciPy LM 的阻尼细节不同，深度/K 可能有数值差异，需与官方 dense 输出对照；不能仅凭合成测试认定真实模型内参一致。先在目标机运行：
+
+```bash
+python -m unittest tests.test_pointcloud_torch tests.test_npu_preprocessing -v
+# 真实权重、真实 NPU dense 前向；不会回退到 CPU。
+python -c "import torch, torch_npu; print(torch.npu.is_available()); from src.depth_estimation import create_depth_estimator; m=create_depth_estimator('moge3-vitl', device='npu'); p=m.predict(torch.rand(3, 480, 768, device='npu')); print(p.depth.device, p.depth.shape, torch.isfinite(p.depth).all().item(), p.refine_steps)"
+python cam_render.py --device npu --depth_model moge3-vitl \
+  --reference_image data/demo/flux-0.png \
+  --output_path outputs/npu_smoke/render --nframe 5 \
+  --d_phi 5 --torch_chunk_size 8192
+```
+
+先检查 5 帧，再使用训练需要的 17 帧；`5` 仅用于渲染 smoke test。记录峰值 HBM、MoGe/分割/逐帧点云渲染耗时，并检查 mask 是否全白、边缘是否异常。人体动作驱动 `alignment.py` 还包含 SMPL 网格渲染，不属于本次静态相机控制 NPU 流程，不能将上述修改视为其完整昇腾适配。
+
+### 全流程顺序
+
+```bash
+# 1. 深度、分割、轨迹、render/mask：NPU
+python cam_render.py --device npu --depth_model moge3-vitl \
+  --reference_image data/static/samples/scene000/reference.png \
+  --output_path data/static/samples/scene000/render \
+  --nframe 17 --d_phi -15 --renderer_backend torch
+
+# 2. 冻结 UMT5/CLIP/VAE 编码：NPU
+python prepare_static_cache.py --device npu \
+  --manifest data/static/static_train.jsonl \
+  --output_dir cache/static_17 --nframe 17 --max_area 368640
+
+# 3. 模型、缓存形状检查（不做前反向）
+python train_static_lora.py --device npu \
+  --cache_dir cache/static_17 --output_dir outputs/validate --validate_only
+
+# 4. 实际一步前反向和 adapter 保存：NPU
+python train_static_lora.py --device npu \
+  --cache_dir cache/static_17 --output_dir outputs/smoke_lora \
+  --max_steps 1 --gradient_accumulation 1 --save_every 1
+
+# 5. 相机控制生成：NPU（推理允许 CPU model offload）
+python cam_control.py --device npu \
+  --reference_image data/static/samples/scene000/reference.png \
+  --render_path data/static/samples/scene000/render \
+  --output_path outputs/scene000.mp4 --nframe 17 \
+  --static_lora outputs/smoke_lora/latest \
+  --prompt "Completely static scene; only the camera moves." --seed 1024
+```
+
+必须按顺序确认每一步成功，尤其不能把 `--validate_only` 当成一步前反向已经通过。首次推理可不加载 `--static_lora` 跑官方基线，再固定 seed 做 A/B。
 
 ## 5. 数据清单
 

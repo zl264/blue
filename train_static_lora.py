@@ -79,6 +79,7 @@ def run(args):
         raise RuntimeError("CPU is useful for preprocessing only; 14B training requires npu or cuda")
     seed_everything(args.seed, device)
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    model_generator = torch.Generator(device=device).manual_seed(args.seed)
     dataset = LatentCacheDataset(args.cache_dir)
     cache_metadata_path = Path(args.cache_dir) / "cache_manifest.json"
     if not cache_metadata_path.exists():
@@ -135,9 +136,9 @@ def run(args):
     # default shift=1. Preserve that schedule for training noise and timesteps.
     inference_scheduler = UniPCMultistepScheduler.from_pretrained(args.base_model_id, subfolder="scheduler")
     scheduler = FlowMatchEulerDiscreteScheduler(shift=inference_scheduler.config.flow_shift)
-    scheduler.set_timesteps(1000, device="cpu")
-    sigmas = scheduler.sigmas[:-1].float().cpu()
-    timesteps = scheduler.timesteps.float().cpu()
+    scheduler.set_timesteps(1000, device=device)
+    sigmas = scheduler.sigmas[:-1].float()
+    timesteps = scheduler.timesteps.float()
     if sigmas.numel() != 1000:
         raise RuntimeError(f"Expected 1000 training sigmas, got {sigmas.numel()}")
     output_dir = Path(args.output_dir)
@@ -175,13 +176,21 @@ def run(args):
             else:
                 camera_embedding = None
             target = batch["target_latent"].float()
-            noise = torch.randn(target.shape, device=device, dtype=torch.float32)
+            noise = torch.randn(
+                target.shape, device=device, dtype=torch.float32,
+                generator=model_generator,
+            )
             if args.timestep_sampling == "uniform":
-                indices = torch.randint(0, 1000, (target.shape[0],), generator=generator)
+                indices = torch.randint(
+                    0, 1000, (target.shape[0],), device=device,
+                    generator=model_generator,
+                )
             else:
-                normal = torch.randn(target.shape[0], generator=generator) * args.logit_std + args.logit_mean
+                normal = (torch.randn(
+                    target.shape[0], device=device, generator=model_generator,
+                ) * args.logit_std + args.logit_mean)
                 indices = (normal.sigmoid() * 999).long().clamp(0, 999)
-            sigma = sigmas[indices].to(device)[:, None, None, None, None]
+            sigma = sigmas[indices.to(device)][:, None, None, None, None]
             noisy = (1 - sigma) * target + sigma * noise
             flow_target = noise - target
             model_input = torch.cat([noisy, batch["condition"].float()], dim=1).to(torch.bfloat16)

@@ -106,6 +106,10 @@ pip install git+https://github.com/microsoft/MoGe.git
 
 FlexGEMM 等间接依赖的许可证也应在商业发布时随 SBOM 一起审核；本轮 GitHub API 达到限流，未能完整核验每个间接依赖许可证，不能声称整个依赖树均已完成法律审查。
 
+### NPU 静态预处理例外
+
+Ascend 静态主流程已提供 `src/moge_npu.py` 的 dense-only loader：隔离未使用的稀疏 refiner import，严格加载全部 dense 权重，ViT-g 使用 PyTorch SwiGLU。安装与验证方式见 [910B2 指南](ascend_static_scene.md)，不要直接执行上面的官方完整依赖安装。NPU 不使用稀疏细化，也不支持 Depth-Pro/MoGe-2 作为静默回退。该路径仍需要真实 910B2 的 dense 前向验证。
+
 ## 6. 使用
 
 ```bash

@@ -220,8 +220,9 @@ def main():
             latents=torch.zeros(1, vae.config.z_dim, (args.nframe - 1) // 4 + 1,
                                 height // 8, width // 8, device=device),
         )
-        with torch.autocast(device_type="cpu", enabled=False):
-            camera_embedding = camera_embedding.float().cpu() if camera_embedding is not None else None
+        # Ray construction remains on the selected device. Host transfer occurs
+        # only when assembling the serialized cache, alongside the other tensors.
+        camera_embedding = camera_embedding.float() if camera_embedding is not None else None
         cache.update({
             "target_latent": target_latent[0].to(dtype).cpu(),
             "condition": condition[0].to(dtype).cpu(),

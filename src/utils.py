@@ -181,16 +181,16 @@ def traj_map(traj_type):
     return cam_traj, x_offset, y_offset, z_offset, d_theta, d_phi, d_r
 
 
-def set_initial_camera(start_elevation, radius):
+def set_initial_camera(start_elevation, radius, device="cpu", dtype=torch.float32):
     c2w_0 = torch.tensor([[1, 0, 0, 0],
                           [0, 1, 0, 0],
                           [0, 0, 1, -radius],
-                          [0, 0, 0, 1]], dtype=torch.float32)
+                          [0, 0, 0, 1]], dtype=dtype, device=device)
     elevation_rad = np.deg2rad(start_elevation)
     R_elevation = torch.tensor([[1, 0, 0, 0],
                                 [0, np.cos(-elevation_rad), -np.sin(-elevation_rad), 0],
                                 [0, np.sin(-elevation_rad), np.cos(-elevation_rad), 0],
-                                [0, 0, 0, 1]], dtype=torch.float32)
+                                [0, 0, 0, 1]], dtype=dtype, device=device)
     c2w_0 = R_elevation @ c2w_0
     w2c_0 = c2w_0.inverse()
 
@@ -262,15 +262,18 @@ def build_cameras(cam_traj, w2c_0, c2w_0, intrinsic, nframe, focal_length,
         R_theta = torch.tensor([[1, 0, 0, 0],
                                 [0, np.cos(d_theta_rad), -np.sin(d_theta_rad), 0],
                                 [0, np.sin(d_theta_rad), np.cos(d_theta_rad), 0],
-                                [0, 0, 0, 1]], dtype=torch.float32)
+                                [0, 0, 0, 1]], dtype=c2w_base.dtype, device=c2w_base.device)
         d_phi_rad = np.deg2rad(d_phis[i])
         R_phi = torch.tensor([[np.cos(d_phi_rad), 0, np.sin(d_phi_rad), 0],
                               [0, 1, 0, 0],
                               [-np.sin(d_phi_rad), 0, np.cos(d_phi_rad), 0],
-                              [0, 0, 0, 1]], dtype=torch.float32)
+                              [0, 0, 0, 1]], dtype=c2w_base.dtype, device=c2w_base.device)
         c2w_1 = R_phi @ R_theta @ c2w_base
         if i < len(x_offsets) and i < len(y_offsets) and i < len(z_offsets):
-            c2w_1[:3, -1] += torch.tensor([x_offsets[i], y_offsets[i], z_offsets[i]])
+            c2w_1[:3, -1] += torch.tensor(
+                [x_offsets[i], y_offsets[i], z_offsets[i]],
+                dtype=c2w_base.dtype, device=c2w_base.device,
+            )
         c2w_1[:3, -1] *= d_rs[i]
         if orbit_center is not None:
             c2w_1[:3, -1] += orbit_center

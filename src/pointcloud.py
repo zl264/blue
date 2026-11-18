@@ -3,23 +3,48 @@ import os
 import sys
 
 import einops
-import kornia
 import torch
-from pytorch3d.renderer import (
-    PointsRenderer,
-    PointsRasterizer,
-    AlphaCompositor,
-    PerspectiveCameras,
-)
-from pytorch3d.structures import Pointclouds
 
 from src.utils import points_padding
 
 
+def __getattr__(name):
+    """Preserve the legacy alignment import without eager PyTorch3D imports."""
+    if name == "PointsZbufRenderer":
+        from pytorch3d.renderer import PointsRenderer
+
+        class PointsZbufRenderer(PointsRenderer):
+            def forward(self, point_clouds, **kwargs):
+                fragments = self.rasterizer(point_clouds, **kwargs)
+                radius = self.rasterizer.raster_settings.radius
+                dists2 = fragments.dists.permute(0, 3, 1, 2)
+                weights = 1 - dists2 / (radius * radius)
+                images = self.compositor(
+                    fragments.idx.long().permute(0, 3, 1, 2), weights,
+                    point_clouds.features_packed().permute(1, 0), **kwargs,
+                )
+                return images.permute(0, 2, 3, 1), fragments.zbuf
+
+        return PointsZbufRenderer
+    raise AttributeError(name)
+
+
 def get_boundaries_mask(disparity, sobel_threshold=0.3):
     def sobel_filter(disp, mode="sobel", beta=10.0):
-        sobel_grad = kornia.filters.spatial_gradient(disp, mode=mode, normalized=False)
-        sobel_mag = torch.sqrt(sobel_grad[:, :, 0, Ellipsis] ** 2 + sobel_grad[:, :, 1, Ellipsis] ** 2)
+        # Kornia's spatial gradient is equivalent to padding + a fixed depthwise
+        # convolution. Keeping the small formula here avoids importing Kornia or
+        # a renderer backend during NPU preprocessing.
+        import torch.nn.functional as F
+
+        if mode != "sobel":
+            raise ValueError("Only Sobel gradients are supported")
+        kernels = torch.tensor(
+            [[[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+             [[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]],
+            dtype=disp.dtype, device=disp.device,
+        ).unsqueeze(1)
+        gradient = F.conv2d(F.pad(disp, (1, 1, 1, 1), mode="reflect"), kernels)
+        sobel_mag = torch.sqrt(gradient[:, 0:1] ** 2 + gradient[:, 1:2] ** 2)
         alpha = torch.exp(-1.0 * beta * sobel_mag).detach()
 
         return alpha
@@ -27,33 +52,6 @@ def get_boundaries_mask(disparity, sobel_threshold=0.3):
     sobel_beta = 10.0
     normalized_disparity = (disparity - disparity.min()) / (disparity.max() - disparity.min() + 1e-6)
     return sobel_filter(normalized_disparity, "sobel", beta=sobel_beta) < sobel_threshold
-
-
-class PointsZbufRenderer(PointsRenderer):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-    def forward(self, point_clouds, **kwargs):
-        fragments = self.rasterizer(point_clouds, **kwargs)
-
-        # Construct weights based on the distance of a point to the true point.
-        # However, this could be done differently: e.g. predicted as opposed
-        # to a function of the weights.
-        r = self.rasterizer.raster_settings.radius
-
-        dists2 = fragments.dists.permute(0, 3, 1, 2)
-        weights = 1 - dists2 / (r * r)
-        images = self.compositor(
-            fragments.idx.long().permute(0, 3, 1, 2),
-            weights,
-            point_clouds.features_packed().permute(1, 0),
-            **kwargs,
-        )
-
-        # permute so image comes at the end
-        images = images.permute(0, 2, 3, 1)
-
-        return images, fragments.zbuf
 
 
 @contextlib.contextmanager
@@ -88,7 +86,8 @@ def contract_depth(depth, contract=8.0):
 
 def point_rendering(K, w2cs, depth, image, raster_settings, device,
                     background_color=[0, 0, 0], sobel_threshold=0.35, contract=8.0,
-                    sam_mask=None):
+                    sam_mask=None, renderer_backend="auto", torch_splat_radius=1,
+                    torch_chunk_size=32768):
     """
     only support batchsize=1
     :param K: [F,3,3]
@@ -114,22 +113,21 @@ def point_rendering(K, w2cs, depth, image, raster_settings, device,
         render_rgbs = torch.zeros((nframe, 3, h, w), device=device, dtype=torch.float32)
         render_masks = torch.ones((nframe, 1, h, w), device=device, dtype=torch.float32)
     else:
-        mid_depth = torch.median(depth.reshape(-1), dim=0)[0] * contract
         depth = contract_depth(depth, contract=contract)
 
         point_depth = einops.rearrange(depth[0], "c h w -> (h w) c")
         disp = 1 / (depth + 1e-7)
         boundary_mask = get_boundaries_mask(disp, sobel_threshold=sobel_threshold)
 
-        x = torch.arange(w).float() + 0.5
-        y = torch.arange(h).float() + 0.5
-        points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1).to(device)
+        x = torch.arange(w, device=device).float() + 0.5
+        y = torch.arange(h, device=device).float() + 0.5
+        points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1)
         points = einops.rearrange(points, "w h c -> (h w) c")
-        # GPU求逆有错
-        points_3d = (c2ws[0] @ points_padding((K[0].cpu().inverse().to(device) @ points_padding(points).T).T * point_depth).T).T[:, :3]
+        points_3d = (c2ws[0] @ points_padding((K[0].inverse() @ points_padding(points).T).T * point_depth).T).T[:, :3]
 
         colors = einops.rearrange(image[0], "c h w -> (h w) c")
 
+        # boundary mask: [1,1,H,W] -> [P]
         boundary_mask = boundary_mask.reshape(-1)
         if sam_mask is not None:
             sam_mask = sam_mask.reshape(-1)
@@ -146,38 +144,70 @@ def point_rendering(K, w2cs, depth, image, raster_settings, device,
 
         colors = colors[boundary_mask == False]
 
-        point_cloud = Pointclouds(points=[points_3d.to(device)], features=[colors.to(device)]).extend(nframe)
+        if renderer_backend == "auto":
+            renderer_backend = "torch" if torch.device(device).type in ("npu", "cpu") else "pytorch3d"
+        if renderer_backend == "torch":
+            from src.pointcloud_torch import render_points_torch
 
-        # convert opencv to opengl coordinate
-        c2ws[:, :, 0] = - c2ws[:, :, 0]
-        c2ws[:, :, 1] = - c2ws[:, :, 1]
-        w2cs = c2ws.inverse()
+            print(
+                f"Using pure PyTorch point splatting on {device}; "
+                f"radius={torch_splat_radius}, chunk={torch_chunk_size}. "
+                "This is not bit-identical to PyTorch3D compositing."
+            )
+            render_rgbs, render_masks = render_points_torch(
+                points_3d, colors, K, w2cs, h, w,
+                background_color=background_color,
+                splat_radius=torch_splat_radius, chunk_size=torch_chunk_size,
+                progress=True,
+            )
+        elif renderer_backend == "pytorch3d":
+            # Import CUDA-oriented renderer dependencies only on the legacy path.
+            # Importing this module on Ascend must not initialize PyTorch3D.
+            from pytorch3d.renderer import (
+                PointsRenderer, PointsRasterizer, AlphaCompositor, PerspectiveCameras,
+            )
+            from pytorch3d.structures import Pointclouds
 
-        focal_length = torch.stack([K[:, 0, 0], K[:, 1, 1]], dim=1)
-        principal_point = torch.stack([K[:, 0, 2], K[:, 1, 2]], dim=1)
-        image_shapes = torch.tensor([[h, w]]).repeat(nframe, 1)
-        cameras = PerspectiveCameras(focal_length=focal_length, principal_point=principal_point,
-                                     R=c2ws[:, :3, :3], T=w2cs[:, :3, -1], in_ndc=False,
-                                     image_size=image_shapes, device=device)
+            class PointsZbufRenderer(PointsRenderer):
+                def forward(self, point_clouds, **kwargs):
+                    fragments = self.rasterizer(point_clouds, **kwargs)
+                    r = self.rasterizer.raster_settings.radius
+                    dists2 = fragments.dists.permute(0, 3, 1, 2)
+                    weights = 1 - dists2 / (r * r)
+                    images = self.compositor(
+                        fragments.idx.long().permute(0, 3, 1, 2), weights,
+                        point_clouds.features_packed().permute(1, 0), **kwargs,
+                    )
+                    return images.permute(0, 2, 3, 1), fragments.zbuf
 
-        renderer = PointsZbufRenderer(
-            rasterizer=PointsRasterizer(cameras=cameras, raster_settings=raster_settings),
-            compositor=AlphaCompositor(background_color=background_color)
-        )
+            point_cloud = Pointclouds(points=[points_3d], features=[colors]).extend(nframe)
 
-        try:
+            # Convert OpenCV camera-local axes to PyTorch3D's screen convention.
+            c2ws[:, :, 0] = -c2ws[:, :, 0]
+            c2ws[:, :, 1] = -c2ws[:, :, 1]
+            w2cs = c2ws.inverse()
+
+            focal_length = torch.stack([K[:, 0, 0], K[:, 1, 1]], dim=1)
+            principal_point = torch.stack([K[:, 0, 2], K[:, 1, 2]], dim=1)
+            image_shapes = torch.tensor(
+                [[h, w]], dtype=torch.float32, device=device,
+            ).repeat(nframe, 1)
+            cameras = PerspectiveCameras(
+                focal_length=focal_length, principal_point=principal_point,
+                R=c2ws[:, :3, :3], T=w2cs[:, :3, -1], in_ndc=False,
+                image_size=image_shapes, device=device,
+            )
+            renderer = PointsZbufRenderer(
+                rasterizer=PointsRasterizer(cameras=cameras, raster_settings=raster_settings),
+                compositor=AlphaCompositor(background_color=background_color),
+            )
             with suppress_stdout_stderr():
-                render_rgbs, zbuf = renderer(point_cloud)  # rgb:[f,h,w,3]
-        except Exception as e:
-            print(f"Error: {e}")
-            print("Error rendering, save pointcloud and other data...")
-            torch.save(points_3d, "point_3d_debug.pt")
-            torch.save(colors, "colors_debug.pt")
-            torch.save(boundary_mask, "boundary_mask_debug.pt")
-
-        render_masks = (zbuf[..., 0:1] == -1).float()  # [f,h,w,1]
-        render_rgbs = einops.rearrange(render_rgbs, "f h w c -> f c h w")  # [f,3,h,w]
-        render_masks = einops.rearrange(render_masks, "f h w c -> f c h w")  # [f,1,h,w]
+                render_rgbs, zbuf = renderer(point_cloud)
+            render_masks = (zbuf[..., 0:1] == -1).float()
+            render_rgbs = einops.rearrange(render_rgbs, "f h w c -> f c h w")
+            render_masks = einops.rearrange(render_masks, "f h w c -> f c h w")
+        else:
+            raise ValueError("renderer_backend must be auto, pytorch3d or torch")
 
     # replace the first frame
     render_rgbs[0:1] = image
